@@ -29,4 +29,17 @@ def test_unpack_int4_known_vals() -> None:
     )
     
     assert torch.equal(result, expected_result)
+    
+def test_pack_unpack_round_trip() -> None:
+    quantized_weights = torch.randint(
+        low=-7,
+        high=8,
+        size=(4, 128),
+        dtype=torch.int8,
+    )
+    packed_weights = pack_int4(quantized_weights)
+    unpacked_weights = unpack_int4(packed_weights)
+    
+    assert torch.equal(unpacked_weights, quantized_weights)
+    
 
