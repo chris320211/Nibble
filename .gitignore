@@ -1,0 +1,48 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Python packages and native-extension builds
+build/
+dist/
+*.egg-info/
+*.so
+*.dylib
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+torch_extensions/
+
+# CUDA and NVIDIA profiler outputs
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+profiles/
+
+# Generated model and benchmark artifacts
+checkpoints/
+artifacts/
+benchmark_results/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
