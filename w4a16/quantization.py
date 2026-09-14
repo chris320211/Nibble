@@ -61,9 +61,42 @@ def unpack_int4(packed_weights: torch.Tensor) -> torch.Tensor:
     unpacked_weights[:, 1::2] = high_vals
     
     return unpacked_weights
-
-
     
+def quantize_groupwise(weights: torch.Tensor, group_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """ Quantize original FP16 weights into signed INT4 values and FP16 quantization scales. """
+    if weights.dtype not in (torch.float16, torch.float32):
+        raise TypeError("weights must have dtype torch.float16 or torch.float32")
+    if weights.ndim != 2:
+        raise ValueError("weights must have shape [N, K]")
+    if group_size <= 0:
+        raise ValueError("group_size must be greater than zero")
+    if weights.shape[1] % group_size != 0:
+        raise ValueError("K must be divisible by group_size")
 
-    
-      
+    weights_float = weights.to(torch.float32)
+    output_features, input_features = weights_float.shape
+    grouped_weights = weights_float.reshape(
+        output_features,
+        input_features // group_size,
+        group_size,
+    )
+
+    max_absolute_values = grouped_weights.abs().amax(dim=2)
+    scales_float = max_absolute_values / 7.0
+    scales_float = torch.where(
+        max_absolute_values == 0,
+        torch.ones_like(scales_float),
+        scales_float,
+    )
+
+    quantized_groups = torch.round(
+        grouped_weights / scales_float.unsqueeze(dim=2)
+    ).clamp(-7, 7)
+
+    quantized_weights = quantized_groups.to(torch.int8).reshape(
+        output_features,
+        input_features,
+    )
+    scales = scales_float.to(torch.float16)
+
+    return quantized_weights, scales
