@@ -100,3 +100,14 @@ def quantize_groupwise(weights: torch.Tensor, group_size: int = 128) -> tuple[to
     scales = scales_float.to(torch.float16)
 
     return quantized_weights, scales
+
+
+def quantize_and_pack_weights(
+    weights: torch.Tensor,
+    group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert floating-point weights into packed INT4 weights via pack_int4 and FP16 scales via quantize_groupwise."""
+    quantized_weights, scales = quantize_groupwise(weights, group_size)
+    packed_weights = pack_int4(quantized_weights)
+
+    return packed_weights, scales
