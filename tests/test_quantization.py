@@ -1,6 +1,11 @@
 import torch
 
-from w4a16.quantization import pack_int4, quantize_groupwise, unpack_int4
+from w4a16.quantization import (
+    pack_int4,
+    quantize_and_pack_weights,
+    quantize_groupwise,
+    unpack_int4,
+)
 
 # Test four vals within int4 range in int8 tensor
 def test_pack_int4_known_vals() -> None:
@@ -61,4 +66,25 @@ def test_quantize_groupwise_known_values() -> None:
     )
 
     assert torch.equal(quantized_weights, expected_quantized_weights)
+    assert torch.equal(scales, expected_scales)
+
+
+def test_quantize_and_pack_weights_known_values() -> None:
+    weights = torch.tensor(
+        [[0.25, -0.375, 0.875, -0.125]],
+        dtype=torch.float16,
+    )
+
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=4)
+
+    expected_packed_weights = torch.tensor(
+        [[0xD2, 0xF7]],
+        dtype=torch.uint8,
+    )
+    expected_scales = torch.tensor(
+        [[0.125]],
+        dtype=torch.float16,
+    )
+
+    assert torch.equal(packed_weights, expected_packed_weights)
     assert torch.equal(scales, expected_scales)
