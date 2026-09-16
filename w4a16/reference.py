@@ -44,3 +44,37 @@ def dequantize_weights(
     dequantized_groups = grouped_weights * grouped_scales
 
     return dequantized_groups.reshape(output_features, input_features)
+
+
+def linear_reference(
+    activations: torch.Tensor,
+    packed_weights: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Compute the quantized linear layer using ordinary PyTorch operations."""
+    if activations.dtype != torch.float16:
+        raise TypeError("activations must have dtype torch.float16")
+    if activations.ndim != 2:
+        raise ValueError("activations must have shape [M, K]")
+    if (
+        activations.device != packed_weights.device
+        or activations.device != scales.device
+    ):
+        raise ValueError("activations, packed_weights, and scales must share a device")
+
+    dequantized_weights = dequantize_weights(
+        packed_weights,
+        scales,
+        group_size,
+    )
+
+    if activations.shape[1] != dequantized_weights.shape[1]:
+        raise ValueError("activations and weights must have the same K dimension")
+
+    output_float = torch.matmul(
+        activations.to(torch.float32),
+        dequantized_weights.transpose(0, 1),
+    )
+
+    return output_float.to(torch.float16)
