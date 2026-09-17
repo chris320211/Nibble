@@ -1,5 +1,6 @@
 import torch
 
+from w4a16.quantization import quantize_and_pack_weights
 from w4a16.reference import linear_reference
 
 
@@ -46,6 +47,31 @@ class QuantizedLinear(torch.nn.Module):
         self.register_buffer("packed_weights", packed_weights.detach())
         self.register_buffer("scales", scales.detach())
         self.register_buffer("bias", None if bias is None else bias.detach())
+
+    @classmethod
+    def from_float(
+        cls,
+        layer: torch.nn.Linear,
+        group_size: int = 128,
+    ) -> "QuantizedLinear":
+        """Convert a floating-point PyTorch linear layer into QuantizedLinear."""
+        if not isinstance(layer, torch.nn.Linear):
+            raise TypeError("layer must be an instance of torch.nn.Linear")
+
+        packed_weights, scales = quantize_and_pack_weights(
+            layer.weight.detach(),
+            group_size,
+        )
+        bias = None
+        if layer.bias is not None:
+            bias = layer.bias.detach().to(torch.float16)
+
+        return cls(
+            packed_weights,
+            scales,
+            group_size=group_size,
+            bias=bias,
+        )
 
     def forward(self, activations: torch.Tensor) -> torch.Tensor:
         if activations.ndim < 1:
