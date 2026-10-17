@@ -1,10 +1,11 @@
 import pytest
 import torch
+import torch.nn.functional as F
 
 from w4a16.cuda import cuda_extension_available
 from w4a16.linear import QuantizedLinear
 from w4a16.quantization import quantize_and_pack_weights
-from w4a16.reference import linear_reference
+from w4a16.reference import dequantize_weights, linear_reference
 
 
 def test_quantized_linear_known_values() -> None:
@@ -156,3 +157,63 @@ def test_quantized_linear_cuda_accepts_noncontiguous_activations() -> None:
         group_size=128,
     )
     torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_quantized_linear_cuda_decode_matches_reference() -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((1, 128), dtype=torch.float16, device=device)
+    weights = torch.randn((8, 128), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+    layer = QuantizedLinear(packed_weights, scales, group_size=128, fused=True)
+
+    result = layer(activations)
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_quantized_linear_cuda_prefill_matches_dequant_linear() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((4, 128), dtype=torch.float16, device=device)
+    weights = torch.randn((8, 128), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+    layer = QuantizedLinear(packed_weights, scales, group_size=128, fused=True)
+    weight_fp16 = dequantize_weights(
+        packed_weights,
+        scales,
+        group_size=128,
+    ).to(dtype=torch.float16)
+
+    result = layer(activations)
+    expected = F.linear(activations, weight_fp16)
+    torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_quantized_linear_cuda_dequant_mode_matches_dequant_linear() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((1, 128), dtype=torch.float16, device=device)
+    weights = torch.randn((8, 128), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+    layer = QuantizedLinear(packed_weights, scales, group_size=128, fused=False)
+    weight_fp16 = dequantize_weights(
+        packed_weights,
+        scales,
+        group_size=128,
+    ).to(dtype=torch.float16)
+
+    result = layer(activations)
+    expected = F.linear(activations, weight_fp16)
+    torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)

@@ -9,6 +9,7 @@ def replace_linear_layers(
     module: torch.nn.Module,
     group_size: int = 128,
     prefix: str = "",
+    fused: bool = True,
 ) -> int:
     """Replace compatible torch.nn.Linear children with QuantizedLinear modules."""
     if group_size <= 0:
@@ -34,6 +35,7 @@ def replace_linear_layers(
             quantized_child = QuantizedLinear.from_float(
                 child,
                 group_size=group_size,
+                fused=fused,
             )
             quantized_child.train(child.training)
             setattr(module, child_name, quantized_child)
@@ -44,6 +46,7 @@ def replace_linear_layers(
             child,
             group_size,
             prefix=qualified_name,
+            fused=fused,
         )
 
     return replacement_count

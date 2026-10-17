@@ -1,8 +1,9 @@
 import torch
+import torch.nn.functional as F
 
 from w4a16.cuda import linear_cuda
 from w4a16.quantization import quantize_and_pack_weights
-from w4a16.reference import linear_reference
+from w4a16.reference import dequantize_weights, linear_reference
 
 
 class QuantizedLinear(torch.nn.Module):
@@ -14,6 +15,7 @@ class QuantizedLinear(torch.nn.Module):
         scales: torch.Tensor,
         group_size: int = 128,
         bias: torch.Tensor | None = None,
+        fused: bool = True,
     ) -> None:
         super().__init__()
 
@@ -48,12 +50,14 @@ class QuantizedLinear(torch.nn.Module):
         self.register_buffer("packed_weights", packed_weights.detach())
         self.register_buffer("scales", scales.detach())
         self.register_buffer("bias", None if bias is None else bias.detach())
+        self.fused = fused
 
     @classmethod
     def from_float(
         cls,
         layer: torch.nn.Linear,
         group_size: int = 128,
+        fused: bool = True,
     ) -> "QuantizedLinear":
         """Convert a floating-point PyTorch linear layer into QuantizedLinear."""
         if not isinstance(layer, torch.nn.Linear):
@@ -72,7 +76,16 @@ class QuantizedLinear(torch.nn.Module):
             scales,
             group_size=group_size,
             bias=bias,
+            fused=fused,
         )
+
+    def _dequant_linear(self, activations: torch.Tensor) -> torch.Tensor:
+        weight = dequantize_weights(
+            self.packed_weights,
+            self.scales,
+            self.group_size,
+        ).to(dtype=torch.float16)
+        return F.linear(activations, weight)
 
     def forward(self, activations: torch.Tensor) -> torch.Tensor:
         if activations.ndim < 1:
@@ -90,17 +103,24 @@ class QuantizedLinear(torch.nn.Module):
         # HuggingFace generate often yields non-contiguous views; the CUDA op
         # still requires a packed layout, so the module copies here.
         flat_activations = activations.contiguous().reshape(-1, self.in_features)
+        rows = flat_activations.shape[0]
         if flat_activations.is_cuda:
             if not self.packed_weights.is_contiguous():
                 raise ValueError("packed_weights must be contiguous")
             if not self.scales.is_contiguous():
                 raise ValueError("scales must be contiguous")
-            flat_output = linear_cuda(
-                flat_activations,
-                self.packed_weights,
-                self.scales,
-                self.group_size,
-            )
+            # Decode (M=1) uses the fused kernel. Prefill (M>1) dequantizes a
+            # temporary FP16 weight matrix and uses cuBLAS so generate is not
+            # stuck on the naive fused fallback.
+            if self.fused and rows == 1:
+                flat_output = linear_cuda(
+                    flat_activations,
+                    self.packed_weights,
+                    self.scales,
+                    self.group_size,
+                )
+            else:
+                flat_output = self._dequant_linear(flat_activations)
         else:
             flat_output = linear_reference(
                 flat_activations,

@@ -72,3 +72,13 @@ def test_replace_linear_layers_warns_on_unaligned_in_features() -> None:
     assert replacement_count == 1
     assert isinstance(model.aligned, QuantizedLinear)
     assert isinstance(model.nested[0], torch.nn.Linear)
+
+
+def test_replace_linear_layers_fused_flag() -> None:
+    model = ToyModel()
+
+    replacement_count = replace_linear_layers(model, group_size=4, fused=False)
+
+    assert replacement_count == 2
+    assert model.direct.fused is False
+    assert model.nested[0].fused is False
