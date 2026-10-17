@@ -34,7 +34,11 @@ Implemented:
 - `QuantizedLinear` (CPU uses the reference; CUDA uses the fused op)
 - Versioned per-tensor checkpoint (`format=w4a16-linear`, `version=1`)
 - `replace_linear_layers`: skips layers with `in_features % group_size != 0` and
-  emits a warning
+  emits a warning. `packed_only=True` allocates empty INT4 storage from shapes
+  so a checkpoint can load without reading FP16 weights
+- Packed-only TinyLlama generate: fused/dequant build an empty model from
+  config, then load `checkpoints/tinyllama-w4a16.pt` (no resident FP16 Linear
+  weights). FP16 generate still loads the original Hugging Face checkpoint
 - Naive fused CUDA kernel, plus a fast `M = 1` decode kernel (one warp owns one
   output channel) when `M == 1` and `group_size == 128`
 
@@ -77,8 +81,9 @@ From `w4a16`:
 | Symbol | Role |
 | --- | --- |
 | `quantize_and_pack_weights` | FP16/FP32 `[N, K]` -> packed weights + scales |
-| `QuantizedLinear` | Inference module; `from_float` converts `nn.Linear` |
-| `replace_linear_layers` | Recursively replace compatible `nn.Linear` |
+| `QuantizedLinear` | Inference module; `from_float` converts `nn.Linear`; `empty` allocates packed storage without FP16 weights |
+| `replace_linear_layers` | Recursively replace compatible `nn.Linear`; `packed_only=True` skips quantization |
+| `load_packed_state_dict` | Empty-replace Linear modules, `to_empty` onto a device, load packed weights |
 | `linear_cuda` | Fused CUDA op (`torch.ops.w4a16.linear`) |
 | `cuda_extension_available` | Whether `w4a16._C` loaded |
 | `save_quantized_weight_checkpoint` | Write one packed tensor + metadata |
@@ -105,7 +110,9 @@ python scripts/benchmark.py
 `generate.py` times TinyLlama generate for resident FP16, dequant-every-call +
 cuBLAS, and fused decode (`M = 1` kernel, `M > 1` dequant + cuBLAS). That is
 quality and end-to-end tok/s, not a kernel-correctness test. `--mode all` runs
-the three baselines sequentially on the same GPU.
+the three baselines sequentially on the same GPU. `--mode fp16` loads the
+Hugging Face FP16 weights. `--mode fused` and `--mode dequant` load only the
+packed checkpoint onto an empty model, so peak MiB is INT4-resident inference.
 
 `benchmark.py` runs three isolated baselines, sequentially, with CUDA events:
 
@@ -146,8 +153,9 @@ weight storage is about 3.9× smaller than FP16.
 `TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
 template. Fused decode uses the `M = 1` kernel; fused prefill (`M > 1`) uses
 dequant + cuBLAS. `tok/s` is `1000 * new_tokens / generate_ms` and includes
-prefill. Peak MiB for INT4 modes includes loading FP16 then converting, not
-packed-only inference.
+prefill. Fused/dequant now load packed weights only; the INT4 peak MiB rows
+below were measured with the old FP16-then-convert load path. Re-run
+`generate.py` on T4 to replace those peaks.
 
 Compare the haiku rows: all three modes emitted 32 new tokens. FP16 `2+2`
 stopped at 9 tokens, so that tok/s is not comparable.
