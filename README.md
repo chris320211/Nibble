@@ -1,102 +1,83 @@
 # Fused W4A16 linear (T4)
 
-PyTorch CUDA operator for LLM decode:
+CUDA operator for LLM decode on NVIDIA T4 (`sm_75`):
 
 ```text
 FP16 activations [M, K]  x  packed INT4 weights [N, K]  ->  FP16 output [M, N]
 ```
 
-Unpack, dequantize, and multiply run in one kernel. A full FP16 weight matrix is
-never written to global memory. Inference only; no backward. Target GPU: NVIDIA
-T4 (`sm_75`). Primary shape is single-token decode (`M = 1`).
+Unpack, dequant, and multiply in one kernel. No full FP16 weight matrix in
+global memory. Inference only. Primary shape: single-token decode (`M = 1`).
 
-## Format
+Kernel correctness is match vs Python `linear_reference` on the same packed
+codes. Difference vs FP16 `nn.Linear` is quantization error, not kernel error.
 
-Symmetric group-wise INT4 along `K`. Default `group_size` is 128.
+## Results (Colab T4)
 
-- Codes are signed integers in `[-7, 7]`.
-- Two codes per `uint8` byte; even `k` is the low nibble, odd `k` the high nibble.
-- Negative codes use four-bit two's complement.
-- Per-group scale: `max(abs(w)) / 7`, or `1.0` for an all-zero group.
+Google Colab Tesla T4, `group_size = 128`. Do not copy numbers from other GPUs.
 
-Stored tensors:
+### TinyLlama generate
 
-```text
-packed_weights: uint8    [N, K / 2]
-scales:         float16  [N, K / group_size]
-```
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
+template. Fused: `M = 1` kernel, `M > 1` dequant+cuBLAS. FP16 loads Hugging Face
+weights; fused/dequant load packed weights only (155 layers). `tok/s` =
+`1000 * new_tokens / generate_ms` (includes prefill). One run, no generate
+warmup.
 
-## Status
+Prompts: `Write a short haiku about GPUs.` and `What is 2+2?`
 
-Implemented:
+| prompt | baseline | tokens | ms | tok/s | allocated MiB | peak MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| haiku | FP16 | 32 | 2206.9 | 14.50 | 2100.18 | 2111.05 |
+| haiku | dequant | 32 | 5898.9 | 5.42 | 642.59 | 1216.48 |
+| haiku | fused | 32 | 1326.1 | 24.13 | 642.59 | 751.22 |
+| 2+2 | FP16 | 9 | 232.2 | 38.76 | 2100.18 | 2111.05 |
+| 2+2 | dequant | 32 | 5614.7 | 5.70 | 642.59 | 1216.48 |
+| 2+2 | fused | 32 | 971.5 | 32.94 | 642.59 | 751.22 |
 
-- Python quantize, pack/unpack, and `linear_reference`
-- `QuantizedLinear` (CPU uses the reference; CUDA uses the fused op)
-- Versioned per-tensor checkpoint (`format=w4a16-linear`, `version=1`)
-- `replace_linear_layers`: skips layers with `in_features % group_size != 0` and
-  emits a warning. `packed_only=True` allocates empty INT4 storage from shapes
-  so a checkpoint can load without reading FP16 weights
-- Packed-only TinyLlama generate: fused/dequant build an empty model from
-  config, then load `checkpoints/tinyllama-w4a16.pt` (no resident FP16 Linear
-  weights). FP16 generate still loads the original Hugging Face checkpoint
-- Naive fused CUDA kernel, plus a fast `M = 1` decode kernel (one warp owns one
-  output channel) when `M == 1` and `group_size == 128`
+- Packed load: **643 MiB** vs **2100 MiB** FP16 (~3.3× smaller). Fused peak
+  **751 MiB** vs **2111 MiB** (~2.8× less). Dequant peaks higher because every
+  call unpacks a full matrix (`lm_head` is largest).
+- Haiku fused is ~4.5× faster than dequant. Compare haiku rows for tok/s (all
+  32 tokens). FP16 `2+2` stopped at 9 tokens.
+- FP16 haiku (14.50 tok/s) is a cold first generate after `from_pretrained`;
+  the next FP16 prompt is 38.76 tok/s. Fused is not faster than warm FP16.
+- Fused and dequant greedy text matched; FP16 wording differed (quantization).
 
-Kernel correctness is match against Python `linear_reference` on the **same**
-packed codes and scales. Difference versus the original FP16 `nn.Linear` is
-quantization error, not kernel error.
+### Operator (`M = 1`)
 
-CPU tests run without a GPU. CUDA tests skip if CUDA or the extension is missing.
-Operator-level T4 numbers for the fast decode kernel are in Results.
+`scripts/benchmark.py`, warmup 5, iters 20. Weight MiB is resident FP16 storage,
+or packed codes + scales.
+
+| shape (M, K, N) | baseline | median ms | p95 ms | peak MiB | weight MiB |
+| --- | --- | --- | --- | --- | --- |
+| (1, 2048, 2048) attention-like | FP16 | 0.0600 | 0.0654 | 16.14 | 8.00 |
+| (1, 2048, 2048) attention-like | dequant | 0.8120 | 0.8189 | 46.32 | 2.06 |
+| (1, 2048, 2048) attention-like | fused | 0.0676 | 0.0737 | 10.20 | 2.06 |
+| (1, 2048, 5632) mlp up-like | FP16 | 0.1188 | 0.1356 | 30.15 | 22.00 |
+| (1, 2048, 5632) mlp up-like | dequant | 2.1220 | 2.1291 | 113.16 | 5.67 |
+| (1, 2048, 5632) mlp up-like | fused | 0.1509 | 0.1721 | 13.82 | 5.67 |
+| (1, 256, 8) small sanity | FP16 | 0.0320 | 0.0444 | 8.13 | 0.0039 |
+| (1, 256, 8) small sanity | dequant | 0.3030 | 0.3152 | 8.15 | 0.0010 |
+| (1, 256, 8) small sanity | fused | 0.0473 | 0.1441 | 8.13 | 0.0010 |
+
+On the two TinyLlama-like shapes, fused is 12×–14× faster than dequant and
+13%–27% slower than resident FP16 cuBLAS. Packed storage is ~3.9× smaller.
+T4 has no INT4 Tensor Cores; the kernel unpacks nibbles and does FP32 math.
+
+Colab: `notebooks/colab_t4.ipynb`.
 
 ## Install
 
-Requires PyTorch with CUDA and `nvcc`. Intended numbers are for a T4 (`sm_75`);
-other Turing GPUs can run the same binary. `setup.py` already passes
-`-gencode arch=compute_75,code=sm_75`.
+PyTorch with CUDA and `nvcc`. `setup.py` targets `sm_75`. TinyLlama scripts
+need `transformers`.
 
 ```bash
 python setup.py build_ext --inplace
 pytest tests/
 ```
 
-TinyLlama scripts also need `transformers`. Operator benches need only PyTorch and the CUDA extension.
-
-## v1 contract
-
-- Activations: contiguous CUDA `float16`
-- Weights: contiguous CUDA `uint8` packed layout
-- Scales: contiguous CUDA `float16`
-- Real fused path: `K % 128 == 0`, `group_size` default 128
-- `QuantizedLinear` on CUDA: `M = 1` uses the fused decode kernel; `M > 1`
-  dequantizes a temporary FP16 weight matrix and uses cuBLAS
-- `fused=False` uses dequant + cuBLAS on every call (generate baseline)
-- No autograd (`requires_grad` is rejected)
-- Bias, if present, is stored on `QuantizedLinear` and added in Python after the op
-
-## API
-
-From `w4a16`:
-
-| Symbol | Role |
-| --- | --- |
-| `quantize_and_pack_weights` | FP16/FP32 `[N, K]` -> packed weights + scales |
-| `QuantizedLinear` | Inference module; `from_float` converts `nn.Linear`; `empty` allocates packed storage without FP16 weights |
-| `replace_linear_layers` | Recursively replace compatible `nn.Linear`; `packed_only=True` skips quantization |
-| `load_packed_state_dict` | Empty-replace Linear modules, `to_empty` onto a device, load packed weights |
-| `linear_cuda` | Fused CUDA op (`torch.ops.w4a16.linear`) |
-| `cuda_extension_available` | Whether `w4a16._C` loaded |
-| `save_quantized_weight_checkpoint` | Write one packed tensor + metadata |
-| `load_quantized_weight_checkpoint` | Load and validate one packed tensor |
-
-CPU path uses `linear_reference` (unpack, dequant to a temporary matrix, matmul).
-The fused CUDA decode kernel does not reconstruct a full FP16 weight matrix.
-Prefill (`M > 1`) and `fused=False` do, as a temporary cuBLAS operand.
-
-## Scripts
-
-These live under `scripts/` and are meant for TinyLlama
-(`TinyLlama/TinyLlama-1.1B-Chat-v1.0`).
+CPU tests run without a GPU. CUDA tests skip if CUDA or the extension is missing.
 
 ```bash
 python scripts/quantize_tinyllama.py
@@ -107,77 +88,36 @@ python scripts/generate.py --mode all --checkpoint checkpoints/tinyllama-w4a16.p
 python scripts/benchmark.py
 ```
 
-`generate.py` times TinyLlama generate for resident FP16, dequant-every-call +
-cuBLAS, and fused decode (`M = 1` kernel, `M > 1` dequant + cuBLAS). That is
-quality and end-to-end tok/s, not a kernel-correctness test. `--mode all` runs
-the three baselines sequentially on the same GPU. `--mode fp16` loads the
-Hugging Face FP16 weights. `--mode fused` and `--mode dequant` load only the
-packed checkpoint onto an empty model, so peak MiB is INT4-resident inference.
+`--mode all` runs FP16, dequant, then fused sequentially. Operator `tok/s` in
+`benchmark.py` is `1000 / median_ms` for one `M = 1` linear, not full generate.
 
-`benchmark.py` runs three isolated baselines, sequentially, with CUDA events:
+## Format
 
-1. Resident FP16 weights + linear
-2. Dequantize packed weights to FP16 on every call + linear
-3. Fused W4A16 kernel
+Symmetric group-wise INT4 along `K`. Default `group_size` is 128. Codes in
+`[-7, 7]`; two per `uint8` (even `k` low nibble, odd `k` high nibble, four-bit
+two's complement). Scale: `max(abs(w)) / 7`, or `1.0` for an all-zero group.
 
-It reports median and p95 latency, peak VRAM, and weight storage. `tok/s` in that
-script is `1000 / median_ms` for one linear at `M = 1`, not full TinyLlama
-generate. Colab notebook: `notebooks/colab_t4.ipynb`.
+```text
+packed_weights: uint8    [N, K / 2]
+scales:         float16  [N, K / group_size]
+```
 
-## Results
+## Contract
 
-Operator-level numbers from Google Colab, NVIDIA Tesla T4 (`sm_75`), `M = 1`,
-warmup 5, iters 20, `group_size = 128`. Do not copy numbers from other GPUs.
+- CUDA `float16` activations, packed `uint8` weights, `float16` scales; all contiguous
+- Fused path: `M = 1`, `K % 128 == 0`, `group_size = 128` (one warp per output channel)
+- `M > 1` or `fused=False`: dequant + cuBLAS
+- No autograd. Bias, if any, is added in Python after the op
 
-Weight MiB is resident FP16 storage for `resident FP16`, and packed INT4 storage
-(codes + FP16 scales) for the other two.
+## API
 
-| shape (M, K, N) | baseline | median ms | p95 ms | peak MiB | weight MiB |
-| --- | --- | --- | --- | --- | --- |
-| (1, 2048, 2048) attention-like | resident FP16 | 0.0600 | 0.0654 | 16.14 | 8.00 |
-| (1, 2048, 2048) attention-like | dequant every call | 0.8120 | 0.8189 | 46.32 | 2.06 |
-| (1, 2048, 2048) attention-like | fused kernel | 0.0676 | 0.0737 | 10.20 | 2.06 |
-| (1, 2048, 5632) mlp up-like | resident FP16 | 0.1188 | 0.1356 | 30.15 | 22.00 |
-| (1, 2048, 5632) mlp up-like | dequant every call | 2.1220 | 2.1291 | 113.16 | 5.67 |
-| (1, 2048, 5632) mlp up-like | fused kernel | 0.1509 | 0.1721 | 13.82 | 5.67 |
-| (1, 256, 8) small sanity | resident FP16 | 0.0320 | 0.0444 | 8.13 | 0.0039 |
-| (1, 256, 8) small sanity | dequant every call | 0.3030 | 0.3152 | 8.15 | 0.0010 |
-| (1, 256, 8) small sanity | fused kernel | 0.0473 | 0.1441 | 8.13 | 0.0010 |
-
-On these two TinyLlama-like decode shapes, fused is about 12×–14× faster than
-dequant-every-call and about 13%–27% slower than resident FP16 cuBLAS. Packed
-weight storage is about 3.9× smaller than FP16.
-
-### TinyLlama generate (Colab T4)
-
-`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
-template. Fused decode uses the `M = 1` kernel; fused prefill (`M > 1`) uses
-dequant + cuBLAS. `tok/s` is `1000 * new_tokens / generate_ms` and includes
-prefill. Fused and dequant load the packed checkpoint onto an empty model (155
-linear layers). FP16 loads the original Hugging Face weights. Allocated MiB is
-resident tensors after load, before generate. Peak MiB is
-`max_memory_allocated` over that mode's generate calls.
-
-Compare the haiku rows: all three modes emitted 32 new tokens. FP16 `2+2`
-stopped at 9 tokens, so that tok/s is not comparable.
-
-| prompt | baseline | new tokens | ms | tok/s | allocated MiB | peak MiB |
-| --- | --- | --- | --- | --- | --- | --- |
-| Write a short haiku about GPUs. | resident FP16 | 32 | 2206.9 | 14.50 | 2100.18 | 2111.05 |
-| Write a short haiku about GPUs. | dequant every call | 32 | 5898.9 | 5.42 | 642.59 | 1216.48 |
-| Write a short haiku about GPUs. | fused | 32 | 1326.1 | 24.13 | 642.59 | 751.22 |
-| What is 2+2? | resident FP16 | 9 | 232.2 | 38.76 | 2100.18 | 2111.05 |
-| What is 2+2? | dequant every call | 32 | 5614.7 | 5.70 | 642.59 | 1216.48 |
-| What is 2+2? | fused | 32 | 971.5 | 32.94 | 642.59 | 751.22 |
-
-Packed-only load holds about 643 MiB after load vs 2100 MiB for resident FP16
-(about 3.3× smaller). Fused generate peaks at 751 MiB vs 2111 MiB FP16 (about
-2.8× less). Dequant peaks higher (1216 MiB) because every call unpacks a full
-weight matrix; `lm_head` is the largest.
-
-On the haiku prompt, fused is about 4.5× faster than dequant-every-call. The
-FP16 haiku row is a cold first generate after `from_pretrained` (14.50 tok/s);
-the second FP16 prompt is 38.76 tok/s, so that 14.50 figure is not the FP16
-decode ceiling. Dequant and fused produced the same greedy text; FP16 wording
-differed (quantization error, not kernel error). One Colab run, no generate
-warmup.
+| Symbol | Role |
+| --- | --- |
+| `quantize_and_pack_weights` | FP16/FP32 `[N, K]` → packed weights + scales |
+| `QuantizedLinear` | Inference module; `from_float` / `empty` |
+| `replace_linear_layers` | Replace compatible `nn.Linear`; `packed_only=True` skips quantize |
+| `load_packed_state_dict` | Empty-replace, `to_empty`, load packed weights |
+| `linear_cuda` | Fused CUDA op |
+| `cuda_extension_available` | Whether `w4a16._C` loaded |
+| `save_quantized_weight_checkpoint` | One packed tensor + metadata |
+| `load_quantized_weight_checkpoint` | Load and validate one packed tensor |
