@@ -2,8 +2,11 @@
 
 Fused decode uses the M=1 kernel; prefill (M>1) dequantizes a temporary FP16
 weight and uses cuBLAS. dequant mode uses cuBLAS on every call, including
-decode. This compares generate QUALITY and tok/s, not kernel correctness.
-Kernel correctness is tests vs linear_reference.
+decode. Quantized modes load packed INT4 weights onto an empty model so the
+original FP16 Linear weights never occupy GPU memory. FP16 mode still loads
+the Hugging Face checkpoint as a separate baseline. This compares generate
+QUALITY, tok/s, and resident VRAM, not kernel correctness. Kernel correctness
+is tests vs linear_reference.
 """
 
 import argparse
@@ -17,9 +20,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from w4a16 import cuda_extension_available, replace_linear_layers
+from w4a16 import cuda_extension_available, load_packed_state_dict
 
 DEFAULT_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 DEFAULT_PROMPTS = [
@@ -58,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(model_id: str, device: str) -> torch.nn.Module:
+def load_fp16_model(model_id: str, device: str) -> torch.nn.Module:
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("cuda is not available")
     try:
@@ -72,6 +75,18 @@ def load_model(model_id: str, device: str) -> torch.nn.Module:
             torch_dtype=torch.float16,
         )
     return model.to(device)
+
+
+def load_empty_causal_lm(model_id: str) -> torch.nn.Module:
+    config = AutoConfig.from_pretrained(model_id)
+    with torch.device("meta"):
+        try:
+            return AutoModelForCausalLM.from_config(config, dtype=torch.float16)
+        except TypeError:
+            return AutoModelForCausalLM.from_config(
+                config,
+                torch_dtype=torch.float16,
+            )
 
 
 def encode_prompt(tokenizer: AutoTokenizer, prompt: str, device: str) -> dict:
@@ -116,38 +131,35 @@ def load_tinyllama_checkpoint(path: str) -> dict:
     return checkpoint
 
 
-def apply_quantized_weights(
-    model: torch.nn.Module,
-    checkpoint_path: str | None,
+def load_packed_model(
+    model_id: str,
+    checkpoint_path: str,
     device: str,
     fused: bool,
-) -> int:
+) -> tuple[torch.nn.Module, int]:
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("cuda is not available")
     if fused and device == "cuda" and not cuda_extension_available():
         raise RuntimeError(
             "The W4A16 CUDA extension is not built. Build it with "
             "`python setup.py build_ext --inplace`."
         )
 
-    group_size = 128
-    checkpoint = None
-    if checkpoint_path is not None:
-        checkpoint = load_tinyllama_checkpoint(checkpoint_path)
-        group_size = checkpoint["group_size"]
-
+    checkpoint = load_tinyllama_checkpoint(checkpoint_path)
+    model = load_empty_causal_lm(model_id)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", UserWarning)
-        replacement_count = replace_linear_layers(
+        replacement_count = load_packed_state_dict(
             model,
-            group_size=group_size,
+            checkpoint["state_dict"],
+            group_size=checkpoint["group_size"],
+            device=device,
             fused=fused,
         )
     for warning in caught:
         if issubclass(warning.category, UserWarning):
             print(warning.message)
-
-    if checkpoint is not None:
-        model.load_state_dict(checkpoint["state_dict"])
-    return replacement_count
+    return model, replacement_count
 
 
 def generate_text(
@@ -231,23 +243,33 @@ def run_mode(
     tokenizer: AutoTokenizer,
     prompts: list[str],
 ) -> list[dict]:
-    model = load_model(args.model, args.device)
-    model.eval()
-    print(f"mode: {mode}")
-    print(f"device: {args.device}")
-    print(f"linear_dispatch: {DISPATCH_LABELS[mode]}")
-    if args.device == "cuda":
-        print(f"gpu: {torch.cuda.get_device_name(0)}")
-        torch.cuda.reset_peak_memory_stats()
-
     if mode in QUANTIZED_MODES:
-        replacement_count = apply_quantized_weights(
-            model,
+        if args.checkpoint is None:
+            raise ValueError("checkpoint is required for fused and dequant")
+        model, replacement_count = load_packed_model(
+            args.model,
             args.checkpoint,
             args.device,
             fused=(mode == "fused"),
         )
+        weight_load = "packed-only checkpoint"
+    else:
+        model = load_fp16_model(args.model, args.device)
+        replacement_count = None
+        weight_load = "resident FP16 from_pretrained"
+
+    model.eval()
+    print(f"mode: {mode}")
+    print(f"device: {args.device}")
+    print(f"weight_load: {weight_load}")
+    print(f"linear_dispatch: {DISPATCH_LABELS[mode]}")
+    if replacement_count is not None:
         print(f"replacement_count: {replacement_count}")
+    if args.device == "cuda":
+        print(f"gpu: {torch.cuda.get_device_name(0)}")
+        allocated_mib = torch.cuda.memory_allocated() / BYTES_PER_MIB
+        print(f"allocated_mib: {allocated_mib:.2f}")
+        torch.cuda.reset_peak_memory_stats()
 
     rows: list[dict] = []
     for prompt in prompts:
@@ -300,6 +322,8 @@ def main() -> None:
         raise ValueError("max_new_tokens must be greater than zero")
     if args.mode == "fp16" and args.checkpoint is not None:
         raise ValueError("checkpoint is only valid with fused, dequant, or all")
+    if args.mode != "fp16" and args.checkpoint is None:
+        raise ValueError("checkpoint is required for fused, dequant, and all")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
