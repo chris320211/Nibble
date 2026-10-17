@@ -6,6 +6,8 @@ Kernel correctness is tests vs linear_reference.
 
 import argparse
 import sys
+import time
+import warnings
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +26,7 @@ DEFAULT_PROMPTS = [
 ]
 CHECKPOINT_FORMAT = "w4a16-tinyllama"
 CHECKPOINT_VERSION = 1
+BYTES_PER_MIB = 1024 * 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,7 +73,7 @@ def apply_fused_weights(
     model: torch.nn.Module,
     checkpoint_path: str | None,
     device: str,
-) -> None:
+) -> int:
     if device == "cuda" and not cuda_extension_available():
         raise RuntimeError(
             "The W4A16 CUDA extension is not built. Build it with "
@@ -83,9 +86,16 @@ def apply_fused_weights(
         checkpoint = load_tinyllama_checkpoint(checkpoint_path)
         group_size = checkpoint["group_size"]
 
-    replace_linear_layers(model, group_size=group_size)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        replacement_count = replace_linear_layers(model, group_size=group_size)
+    for warning in caught:
+        if issubclass(warning.category, UserWarning):
+            print(warning.message)
+
     if checkpoint is not None:
         model.load_state_dict(checkpoint["state_dict"])
+    return replacement_count
 
 
 def generate_text(
@@ -94,9 +104,19 @@ def generate_text(
     prompt: str,
     max_new_tokens: int,
     device: str,
-) -> str:
+) -> tuple[str, int, float]:
     encoded = tokenizer(prompt, return_tensors="pt")
     encoded = {key: value.to(device) for key, value in encoded.items()}
+    prompt_length = encoded["input_ids"].shape[-1]
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    else:
+        start = time.perf_counter()
+
     with torch.inference_mode():
         output_ids = model.generate(
             **encoded,
@@ -104,7 +124,17 @@ def generate_text(
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
-    return tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+    if device == "cuda":
+        end_event.record()
+        torch.cuda.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)
+    else:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    new_tokens = int(output_ids.shape[-1] - prompt_length)
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    return decoded, new_tokens, elapsed_ms
 
 
 def main() -> None:
@@ -120,21 +150,44 @@ def main() -> None:
 
     model = load_model(args.model, args.device)
     model.eval()
+    print(f"mode: {args.mode}")
+    print(f"device: {args.device}")
+    if args.device == "cuda":
+        print(f"gpu: {torch.cuda.get_device_name(0)}")
+        torch.cuda.reset_peak_memory_stats()
+
     if args.mode == "fused":
-        apply_fused_weights(model, args.checkpoint, args.device)
+        replacement_count = apply_fused_weights(
+            model,
+            args.checkpoint,
+            args.device,
+        )
+        print(f"replacement_count: {replacement_count}")
 
     prompts = args.prompts if args.prompts else DEFAULT_PROMPTS
     for prompt in prompts:
-        decoded = generate_text(
+        decoded, new_tokens, elapsed_ms = generate_text(
             model,
             tokenizer,
             prompt,
             args.max_new_tokens,
             args.device,
         )
+        tokens_per_s = (
+            1000.0 * new_tokens / elapsed_ms if elapsed_ms > 0.0 else 0.0
+        )
         print(f"prompt: {prompt}")
         print(decoded)
+        print(
+            f"new_tokens: {new_tokens}  "
+            f"ms: {elapsed_ms:.1f}  "
+            f"tok/s: {tokens_per_s:.2f}"
+        )
         print()
+
+    if args.device == "cuda":
+        peak_mib = torch.cuda.max_memory_allocated() / BYTES_PER_MIB
+        print(f"peak_mib: {peak_mib:.2f}")
 
 
 if __name__ == "__main__":
