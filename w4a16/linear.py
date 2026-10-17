@@ -87,10 +87,10 @@ class QuantizedLinear(torch.nn.Module):
             raise ValueError("activations and packed_weights must share a device")
 
         output_shape = (*activations.shape[:-1], self.out_features)
-        flat_activations = activations.reshape(-1, self.in_features)
+        # HuggingFace generate often yields non-contiguous views; the CUDA op
+        # still requires a packed layout, so the module copies here.
+        flat_activations = activations.contiguous().reshape(-1, self.in_features)
         if flat_activations.is_cuda:
-            if not activations.is_contiguous():
-                raise ValueError("activations must be contiguous")
             if not self.packed_weights.is_contiguous():
                 raise ValueError("packed_weights must be contiguous")
             if not self.scales.is_contiguous():

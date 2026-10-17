@@ -136,7 +136,7 @@ def test_quantized_linear_cuda_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_quantized_linear_cuda_rejects_noncontiguous_activations() -> None:
+def test_quantized_linear_cuda_accepts_noncontiguous_activations() -> None:
     if not cuda_extension_available():
         pytest.skip("W4A16 CUDA extension is not built")
 
@@ -146,6 +146,13 @@ def test_quantized_linear_cuda_rejects_noncontiguous_activations() -> None:
     packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
     layer = QuantizedLinear(packed_weights, scales, group_size=128)
     activations = torch.randn((2, 256), dtype=torch.float16, device=device)[:, :128]
+    assert not activations.is_contiguous()
 
-    with pytest.raises(ValueError, match="activations must be contiguous"):
-        layer(activations)
+    result = layer(activations)
+    expected = linear_reference(
+        activations.contiguous(),
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
