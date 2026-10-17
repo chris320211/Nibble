@@ -64,6 +64,9 @@ TinyLlama scripts also need `transformers`. Operator benches need only PyTorch a
 - Weights: contiguous CUDA `uint8` packed layout
 - Scales: contiguous CUDA `float16`
 - Real fused path: `K % 128 == 0`, `group_size` default 128
+- `QuantizedLinear` on CUDA: `M = 1` uses the fused decode kernel; `M > 1`
+  dequantizes a temporary FP16 weight matrix and uses cuBLAS
+- `fused=False` uses dequant + cuBLAS on every call (generate baseline)
 - No autograd (`requires_grad` is rejected)
 - Bias, if present, is stored on `QuantizedLinear` and added in Python after the op
 
@@ -82,7 +85,8 @@ From `w4a16`:
 | `load_quantized_weight_checkpoint` | Load and validate one packed tensor |
 
 CPU path uses `linear_reference` (unpack, dequant to a temporary matrix, matmul).
-That reconstructs FP16 weights in memory; the CUDA kernels do not.
+The fused CUDA decode kernel does not reconstruct a full FP16 weight matrix.
+Prefill (`M > 1`) and `fused=False` do, as a temporary cuBLAS operand.
 
 ## Scripts
 
@@ -92,13 +96,16 @@ These live under `scripts/` and are meant for TinyLlama
 ```bash
 python scripts/quantize_tinyllama.py
 python scripts/generate.py --mode fp16
-python scripts/generate.py --mode fused
+python scripts/generate.py --mode dequant --checkpoint checkpoints/tinyllama-w4a16.pt
 python scripts/generate.py --mode fused --checkpoint checkpoints/tinyllama-w4a16.pt
+python scripts/generate.py --mode all --checkpoint checkpoints/tinyllama-w4a16.pt
 python scripts/benchmark.py
 ```
 
-`generate.py` compares generation quality of fused W4A16 vs FP16. That is not a
-kernel-correctness test.
+`generate.py` times TinyLlama generate for resident FP16, dequant-every-call +
+cuBLAS, and fused decode (`M = 1` kernel, `M > 1` dequant + cuBLAS). That is
+quality and end-to-end tok/s, not a kernel-correctness test. `--mode all` runs
+the three baselines sequentially on the same GPU.
 
 `benchmark.py` runs three isolated baselines, sequentially, with CUDA events:
 

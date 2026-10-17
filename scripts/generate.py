@@ -1,6 +1,8 @@
-"""Generate TinyLlama text in FP16 or fused INT4 mode.
+"""Generate TinyLlama text in FP16, fused INT4, or dequant-every-call mode.
 
-This compares QUALITY (quantization error vs FP16), not kernel correctness.
+Fused decode uses the M=1 kernel; prefill (M>1) dequantizes a temporary FP16
+weight and uses cuBLAS. dequant mode uses cuBLAS on every call, including
+decode. This compares generate QUALITY and tok/s, not kernel correctness.
 Kernel correctness is tests vs linear_reference.
 """
 
@@ -27,12 +29,24 @@ DEFAULT_PROMPTS = [
 CHECKPOINT_FORMAT = "w4a16-tinyllama"
 CHECKPOINT_VERSION = 1
 BYTES_PER_MIB = 1024 * 1024
+GENERATE_MODES = ("fp16", "dequant", "fused")
+QUANTIZED_MODES = ("dequant", "fused")
+DISPATCH_LABELS = {
+    "fp16": "resident FP16 cuBLAS",
+    "dequant": "dequant+cuBLAS every call",
+    "fused": "M=1 fused kernel, M>1 dequant+cuBLAS",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--mode", choices=["fp16", "fused"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=[*GENERATE_MODES, "all"],
+        required=True,
+        help="all runs fp16, dequant, then fused sequentially on this GPU.",
+    )
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument(
         "--device",
@@ -102,12 +116,13 @@ def load_tinyllama_checkpoint(path: str) -> dict:
     return checkpoint
 
 
-def apply_fused_weights(
+def apply_quantized_weights(
     model: torch.nn.Module,
     checkpoint_path: str | None,
     device: str,
+    fused: bool,
 ) -> int:
-    if device == "cuda" and not cuda_extension_available():
+    if fused and device == "cuda" and not cuda_extension_available():
         raise RuntimeError(
             "The W4A16 CUDA extension is not built. Build it with "
             "`python setup.py build_ext --inplace`."
@@ -121,7 +136,11 @@ def apply_fused_weights(
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", UserWarning)
-        replacement_count = replace_linear_layers(model, group_size=group_size)
+        replacement_count = replace_linear_layers(
+            model,
+            group_size=group_size,
+            fused=fused,
+        )
     for warning in caught:
         if issubclass(warning.category, UserWarning):
             print(warning.message)
@@ -178,34 +197,59 @@ def generate_text(
     return decoded, new_tokens, elapsed_ms
 
 
-def main() -> None:
-    args = parse_args()
-    if args.max_new_tokens <= 0:
-        raise ValueError("max_new_tokens must be greater than zero")
-    if args.mode == "fp16" and args.checkpoint is not None:
-        raise ValueError("checkpoint is only valid with fused mode")
+def format_summary(rows: list[dict]) -> str:
+    headers = ("mode", "prompt", "new_tokens", "ms", "tok/s", "peak_mib")
+    table_rows = [
+        (
+            row["mode"],
+            row["prompt"],
+            str(row["new_tokens"]),
+            f"{row['ms']:.1f}",
+            f"{row['tok_s']:.2f}",
+            f"{row['peak_mib']:.2f}" if row["peak_mib"] is not None else "n/a",
+        )
+        for row in rows
+    ]
+    widths = [
+        max(len(headers[index]), max((len(row[index]) for row in table_rows), default=0))
+        for index in range(len(headers))
+    ]
+    header_line = "  ".join(
+        headers[index].ljust(widths[index]) for index in range(len(headers))
+    )
+    rule = "  ".join("-" * widths[index] for index in range(len(headers)))
+    body = [
+        "  ".join(row[index].ljust(widths[index]) for index in range(len(headers)))
+        for row in table_rows
+    ]
+    return "\n".join([header_line, rule, *body])
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
+def run_mode(
+    mode: str,
+    args: argparse.Namespace,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+) -> list[dict]:
     model = load_model(args.model, args.device)
     model.eval()
-    print(f"mode: {args.mode}")
+    print(f"mode: {mode}")
     print(f"device: {args.device}")
+    print(f"linear_dispatch: {DISPATCH_LABELS[mode]}")
     if args.device == "cuda":
         print(f"gpu: {torch.cuda.get_device_name(0)}")
         torch.cuda.reset_peak_memory_stats()
 
-    if args.mode == "fused":
-        replacement_count = apply_fused_weights(
+    if mode in QUANTIZED_MODES:
+        replacement_count = apply_quantized_weights(
             model,
             args.checkpoint,
             args.device,
+            fused=(mode == "fused"),
         )
         print(f"replacement_count: {replacement_count}")
 
-    prompts = args.prompts if args.prompts else DEFAULT_PROMPTS
+    rows: list[dict] = []
     for prompt in prompts:
         decoded, new_tokens, elapsed_ms = generate_text(
             model,
@@ -225,10 +269,52 @@ def main() -> None:
             f"tok/s: {tokens_per_s:.2f}"
         )
         print()
+        rows.append(
+            {
+                "mode": mode,
+                "prompt": prompt,
+                "new_tokens": new_tokens,
+                "ms": elapsed_ms,
+                "tok_s": tokens_per_s,
+                "peak_mib": None,
+            }
+        )
 
+    peak_mib = None
     if args.device == "cuda":
         peak_mib = torch.cuda.max_memory_allocated() / BYTES_PER_MIB
         print(f"peak_mib: {peak_mib:.2f}")
+    for row in rows:
+        row["peak_mib"] = peak_mib
+
+    del model
+    if args.device == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    return rows
+
+
+def main() -> None:
+    args = parse_args()
+    if args.max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be greater than zero")
+    if args.mode == "fp16" and args.checkpoint is not None:
+        raise ValueError("checkpoint is only valid with fused, dequant, or all")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    prompts = args.prompts if args.prompts else DEFAULT_PROMPTS
+    modes = GENERATE_MODES if args.mode == "all" else (args.mode,)
+    rows: list[dict] = []
+    for mode in modes:
+        rows.extend(run_mode(mode, args, tokenizer, prompts))
+        print()
+
+    if len(modes) > 1:
+        print("generate summary (sequential baselines, never overlapped)")
+        print(format_summary(rows))
 
 
 if __name__ == "__main__":
