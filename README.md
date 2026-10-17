@@ -43,7 +43,7 @@ packed codes and scales. Difference versus the original FP16 `nn.Linear` is
 quantization error, not kernel error.
 
 CPU tests run without a GPU. CUDA tests skip if CUDA or the extension is missing.
-The fast decode kernel has not been published with T4 numbers yet.
+Operator-level T4 numbers for the fast decode kernel are in Results.
 
 ## Install
 
@@ -106,15 +106,31 @@ kernel-correctness test.
 2. Dequantize packed weights to FP16 on every call + linear
 3. Fused W4A16 kernel
 
-It reports median and p95 latency, peak VRAM, and weight storage. Publish numbers
-from an on-demand `g4dn.xlarge` (one T4).
+It reports median and p95 latency, peak VRAM, and weight storage. `tok/s` in that
+script is `1000 / median_ms` for one linear at `M = 1`, not full TinyLlama
+generate. Colab notebook: `notebooks/colab_t4.ipynb`.
 
 ## Results
 
-Fill in after a T4 run. Do not copy numbers from other GPUs.
+Operator-level numbers from Google Colab, NVIDIA Tesla T4 (`sm_75`), `M = 1`,
+warmup 5, iters 20, `group_size = 128`. Do not copy numbers from other GPUs.
+
+Weight MiB is resident FP16 storage for `resident FP16`, and packed INT4 storage
+(codes + FP16 scales) for the other two.
 
 | shape (M, K, N) | baseline | median ms | p95 ms | peak MiB | weight MiB |
 | --- | --- | --- | --- | --- | --- |
-| | resident FP16 | | | | |
-| | dequant every call | | | | |
-| | fused kernel | | | | |
+| (1, 2048, 2048) attention-like | resident FP16 | 0.0600 | 0.0654 | 16.14 | 8.00 |
+| (1, 2048, 2048) attention-like | dequant every call | 0.8120 | 0.8189 | 46.32 | 2.06 |
+| (1, 2048, 2048) attention-like | fused kernel | 0.0676 | 0.0737 | 10.20 | 2.06 |
+| (1, 2048, 5632) mlp up-like | resident FP16 | 0.1188 | 0.1356 | 30.15 | 22.00 |
+| (1, 2048, 5632) mlp up-like | dequant every call | 2.1220 | 2.1291 | 113.16 | 5.67 |
+| (1, 2048, 5632) mlp up-like | fused kernel | 0.1509 | 0.1721 | 13.82 | 5.67 |
+| (1, 256, 8) small sanity | resident FP16 | 0.0320 | 0.0444 | 8.13 | 0.0039 |
+| (1, 256, 8) small sanity | dequant every call | 0.3030 | 0.3152 | 8.15 | 0.0010 |
+| (1, 256, 8) small sanity | fused kernel | 0.0473 | 0.1441 | 8.13 | 0.0010 |
+
+On these two TinyLlama-like decode shapes, fused is about 12×–14× faster than
+dequant-every-call and about 13%–27% slower than resident FP16 cuBLAS. Packed
+weight storage is about 3.9× smaller than FP16. TinyLlama generate quality and
+end-to-end tok/s are not in this table; run `scripts/generate.py` on a T4.
