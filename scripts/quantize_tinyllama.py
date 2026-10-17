@@ -32,10 +32,16 @@ def parse_args() -> argparse.Namespace:
 def load_model(model_id: str, device: str) -> torch.nn.Module:
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("cuda is not available")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.float16,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+        )
     return model.to(device)
 
 

@@ -47,11 +47,44 @@ def parse_args() -> argparse.Namespace:
 def load_model(model_id: str, device: str) -> torch.nn.Module:
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("cuda is not available")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.float16,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+        )
     return model.to(device)
+
+
+def encode_prompt(tokenizer: AutoTokenizer, prompt: str, device: str) -> dict:
+    messages = [{"role": "user", "content": prompt}]
+    if getattr(tokenizer, "chat_template", None):
+        try:
+            encoded = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+        except TypeError:
+            input_ids = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+            )
+            encoded = {
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids),
+            }
+    else:
+        encoded = tokenizer(prompt, return_tensors="pt")
+    return {key: value.to(device) for key, value in encoded.items()}
 
 
 def load_tinyllama_checkpoint(path: str) -> dict:
@@ -105,9 +138,13 @@ def generate_text(
     max_new_tokens: int,
     device: str,
 ) -> tuple[str, int, float]:
-    encoded = tokenizer(prompt, return_tensors="pt")
-    encoded = {key: value.to(device) for key, value in encoded.items()}
+    encoded = encode_prompt(tokenizer, prompt, device)
     prompt_length = encoded["input_ids"].shape[-1]
+    pad_token_id = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else tokenizer.eos_token_id
+    )
 
     if device == "cuda":
         torch.cuda.synchronize()
@@ -118,11 +155,11 @@ def generate_text(
         start = time.perf_counter()
 
     with torch.inference_mode():
-        output_ids = model.generate(
+        generated = model.generate(
             **encoded,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=pad_token_id,
         )
 
     if device == "cuda":
@@ -132,8 +169,12 @@ def generate_text(
     else:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
+    output_ids = generated.sequences if hasattr(generated, "sequences") else generated
     new_tokens = int(output_ids.shape[-1] - prompt_length)
-    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    decoded = tokenizer.decode(
+        output_ids[0, prompt_length:],
+        skip_special_tokens=True,
+    )
     return decoded, new_tokens, elapsed_ms
 
 
@@ -177,7 +218,7 @@ def main() -> None:
             1000.0 * new_tokens / elapsed_ms if elapsed_ms > 0.0 else 0.0
         )
         print(f"prompt: {prompt}")
-        print(decoded)
+        print(f"output: {decoded}")
         print(
             f"new_tokens: {new_tokens}  "
             f"ms: {elapsed_ms:.1f}  "
