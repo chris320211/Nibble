@@ -44,6 +44,29 @@ def test_quantized_linear_known_values() -> None:
     assert "scales" in layer.state_dict()
 
 
+def test_quantized_linear_empty_shapes() -> None:
+    layer = QuantizedLinear.empty(
+        out_features=2,
+        in_features=4,
+        group_size=4,
+        bias=True,
+        fused=False,
+    )
+
+    assert layer.packed_weights.shape == (2, 2)
+    assert layer.packed_weights.dtype == torch.uint8
+    assert layer.scales.shape == (2, 1)
+    assert layer.scales.dtype == torch.float16
+    assert layer.bias is not None
+    assert layer.bias.shape == (2,)
+    assert layer.fused is False
+
+
+def test_quantized_linear_empty_rejects_unaligned_in_features() -> None:
+    with pytest.raises(ValueError, match="K must be divisible by group_size"):
+        QuantizedLinear.empty(out_features=2, in_features=6, group_size=4)
+
+
 def test_quantized_linear_from_float() -> None:
     layer = torch.nn.Linear(4, 2, bias=True, dtype=torch.float16)
     with torch.no_grad():

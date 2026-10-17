@@ -79,6 +79,53 @@ class QuantizedLinear(torch.nn.Module):
             fused=fused,
         )
 
+    @classmethod
+    def empty(
+        cls,
+        out_features: int,
+        in_features: int,
+        group_size: int = 128,
+        bias: bool = False,
+        fused: bool = True,
+        device: torch.device | str | None = None,
+    ) -> "QuantizedLinear":
+        """Allocate packed INT4 storage without reading FP16 weights."""
+        if out_features <= 0 or in_features <= 0:
+            raise ValueError("out_features and in_features must be greater than zero")
+        if in_features % 2 != 0:
+            raise ValueError("in_features must be even")
+        if group_size <= 0:
+            raise ValueError("group_size must be greater than zero")
+        if in_features % group_size != 0:
+            raise ValueError("K must be divisible by group_size")
+
+        if device is None:
+            device = torch.device("cpu")
+        packed_weights = torch.empty(
+            (out_features, in_features // 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        scales = torch.empty(
+            (out_features, in_features // group_size),
+            dtype=torch.float16,
+            device=device,
+        )
+        bias_tensor = None
+        if bias:
+            bias_tensor = torch.empty(
+                (out_features,),
+                dtype=torch.float16,
+                device=device,
+            )
+        return cls(
+            packed_weights,
+            scales,
+            group_size=group_size,
+            bias=bias_tensor,
+            fused=fused,
+        )
+
     def _dequant_linear(self, activations: torch.Tensor) -> torch.Tensor:
         weight = dequantize_weights(
             self.packed_weights,
