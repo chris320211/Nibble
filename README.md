@@ -139,5 +139,29 @@ Weight MiB is resident FP16 storage for `resident FP16`, and packed INT4 storage
 
 On these two TinyLlama-like decode shapes, fused is about 12×–14× faster than
 dequant-every-call and about 13%–27% slower than resident FP16 cuBLAS. Packed
-weight storage is about 3.9× smaller than FP16. TinyLlama generate quality and
-end-to-end tok/s are not in this table; run `scripts/generate.py` on a T4.
+weight storage is about 3.9× smaller than FP16.
+
+### TinyLlama generate (Colab T4)
+
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
+template. Fused decode uses the `M = 1` kernel; fused prefill (`M > 1`) uses
+dequant + cuBLAS. `tok/s` is `1000 * new_tokens / generate_ms` and includes
+prefill. Peak MiB for INT4 modes includes loading FP16 then converting, not
+packed-only inference.
+
+Compare the haiku rows: all three modes emitted 32 new tokens. FP16 `2+2`
+stopped at 9 tokens, so that tok/s is not comparable.
+
+| prompt | baseline | new tokens | ms | tok/s | peak MiB |
+| --- | --- | --- | --- | --- | --- |
+| Write a short haiku about GPUs. | resident FP16 | 32 | 1337.6 | 23.92 | 2111.05 |
+| Write a short haiku about GPUs. | dequant every call | 32 | 5773.6 | 5.54 | 2230.85 |
+| Write a short haiku about GPUs. | fused | 32 | 1172.1 | 27.30 | 2230.85 |
+| What is 2+2? | resident FP16 | 9 | 241.8 | 37.22 | 2111.05 |
+| What is 2+2? | dequant every call | 32 | 5607.8 | 5.71 | 2230.85 |
+| What is 2+2? | fused | 32 | 983.5 | 32.54 | 2230.85 |
+
+On the haiku prompt, fused is about 5× faster than dequant-every-call and about
+14% faster than resident FP16. Dequant and fused produced the same greedy text;
+FP16 wording differed (quantization error, not kernel error). One Colab run, no
+generate warmup.
