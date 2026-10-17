@@ -153,23 +153,31 @@ weight storage is about 3.9× smaller than FP16.
 `TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
 template. Fused decode uses the `M = 1` kernel; fused prefill (`M > 1`) uses
 dequant + cuBLAS. `tok/s` is `1000 * new_tokens / generate_ms` and includes
-prefill. Fused/dequant now load packed weights only; the INT4 peak MiB rows
-below were measured with the old FP16-then-convert load path. Re-run
-`generate.py` on T4 to replace those peaks.
+prefill. Fused and dequant load the packed checkpoint onto an empty model (155
+linear layers). FP16 loads the original Hugging Face weights. Allocated MiB is
+resident tensors after load, before generate. Peak MiB is
+`max_memory_allocated` over that mode's generate calls.
 
 Compare the haiku rows: all three modes emitted 32 new tokens. FP16 `2+2`
 stopped at 9 tokens, so that tok/s is not comparable.
 
-| prompt | baseline | new tokens | ms | tok/s | peak MiB |
-| --- | --- | --- | --- | --- | --- |
-| Write a short haiku about GPUs. | resident FP16 | 32 | 1337.6 | 23.92 | 2111.05 |
-| Write a short haiku about GPUs. | dequant every call | 32 | 5773.6 | 5.54 | 2230.85 |
-| Write a short haiku about GPUs. | fused | 32 | 1172.1 | 27.30 | 2230.85 |
-| What is 2+2? | resident FP16 | 9 | 241.8 | 37.22 | 2111.05 |
-| What is 2+2? | dequant every call | 32 | 5607.8 | 5.71 | 2230.85 |
-| What is 2+2? | fused | 32 | 983.5 | 32.54 | 2230.85 |
+| prompt | baseline | new tokens | ms | tok/s | allocated MiB | peak MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| Write a short haiku about GPUs. | resident FP16 | 32 | 2206.9 | 14.50 | 2100.18 | 2111.05 |
+| Write a short haiku about GPUs. | dequant every call | 32 | 5898.9 | 5.42 | 642.59 | 1216.48 |
+| Write a short haiku about GPUs. | fused | 32 | 1326.1 | 24.13 | 642.59 | 751.22 |
+| What is 2+2? | resident FP16 | 9 | 232.2 | 38.76 | 2100.18 | 2111.05 |
+| What is 2+2? | dequant every call | 32 | 5614.7 | 5.70 | 642.59 | 1216.48 |
+| What is 2+2? | fused | 32 | 971.5 | 32.94 | 642.59 | 751.22 |
 
-On the haiku prompt, fused is about 5× faster than dequant-every-call and about
-14% faster than resident FP16. Dequant and fused produced the same greedy text;
-FP16 wording differed (quantization error, not kernel error). One Colab run, no
-generate warmup.
+Packed-only load holds about 643 MiB after load vs 2100 MiB for resident FP16
+(about 3.3× smaller). Fused generate peaks at 751 MiB vs 2111 MiB FP16 (about
+2.8× less). Dequant peaks higher (1216 MiB) because every call unpacks a full
+weight matrix; `lm_head` is the largest.
+
+On the haiku prompt, fused is about 4.5× faster than dequant-every-call. The
+FP16 haiku row is a cold first generate after `from_pretrained` (14.50 tok/s);
+the second FP16 prompt is 38.76 tok/s, so that 14.50 figure is not the FP16
+decode ceiling. Dequant and fused produced the same greedy text; FP16 wording
+differed (quantization error, not kernel error). One Colab run, no generate
+warmup.
