@@ -1,5 +1,6 @@
 import torch
 
+from w4a16.cuda import linear_cuda
 from w4a16.quantization import quantize_and_pack_weights
 from w4a16.reference import linear_reference
 
@@ -78,15 +79,35 @@ class QuantizedLinear(torch.nn.Module):
             raise ValueError("activations must have at least one dimension")
         if activations.shape[-1] != self.in_features:
             raise ValueError("activations last dimension must equal in_features")
+        if activations.dtype != torch.float16:
+            raise TypeError("activations must have dtype torch.float16")
+        if activations.requires_grad:
+            raise RuntimeError("activations must not require grad")
+        if activations.device != self.packed_weights.device:
+            raise ValueError("activations and packed_weights must share a device")
 
         output_shape = (*activations.shape[:-1], self.out_features)
         flat_activations = activations.reshape(-1, self.in_features)
-        flat_output = linear_reference(
-            flat_activations,
-            self.packed_weights,
-            self.scales,
-            self.group_size,
-        )
+        if flat_activations.is_cuda:
+            if not activations.is_contiguous():
+                raise ValueError("activations must be contiguous")
+            if not self.packed_weights.is_contiguous():
+                raise ValueError("packed_weights must be contiguous")
+            if not self.scales.is_contiguous():
+                raise ValueError("scales must be contiguous")
+            flat_output = linear_cuda(
+                flat_activations,
+                self.packed_weights,
+                self.scales,
+                self.group_size,
+            )
+        else:
+            flat_output = linear_reference(
+                flat_activations,
+                self.packed_weights,
+                self.scales,
+                self.group_size,
+            )
         output = flat_output.reshape(output_shape)
 
         if self.bias is not None:

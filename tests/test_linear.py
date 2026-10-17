@@ -1,7 +1,10 @@
+import pytest
 import torch
 
+from w4a16.cuda import cuda_extension_available
 from w4a16.linear import QuantizedLinear
 from w4a16.quantization import quantize_and_pack_weights
+from w4a16.reference import linear_reference
 
 
 def test_quantized_linear_known_values() -> None:
@@ -68,3 +71,81 @@ def test_quantized_linear_from_float() -> None:
 
     assert torch.equal(result, expected)
     assert torch.equal(quantized_layer.bias, layer.bias)
+
+
+def test_quantized_linear_rejects_float32_activations() -> None:
+    weights = torch.tensor(
+        [
+            [0.25, -0.375, 0.875, -0.125],
+            [0.25, 0.5, -0.25, 1.75],
+        ],
+        dtype=torch.float16,
+    )
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=4)
+    layer = QuantizedLinear(packed_weights, scales, group_size=4)
+    activations = torch.ones((2, 4), dtype=torch.float32)
+
+    with pytest.raises(TypeError, match="activations must have dtype torch.float16"):
+        layer(activations)
+
+
+def test_quantized_linear_rejects_requires_grad() -> None:
+    weights = torch.tensor(
+        [
+            [0.25, -0.375, 0.875, -0.125],
+            [0.25, 0.5, -0.25, 1.75],
+        ],
+        dtype=torch.float16,
+    )
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=4)
+    layer = QuantizedLinear(packed_weights, scales, group_size=4)
+    activations = torch.ones((2, 4), dtype=torch.float16, requires_grad=True)
+
+    with pytest.raises(RuntimeError, match="activations must not require grad"):
+        layer(activations)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_quantized_linear_cuda_matches_reference() -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((2, 128), dtype=torch.float16, device=device)
+    weights = torch.randn((8, 128), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+    bias = torch.randn((8,), dtype=torch.float16, device=device)
+    layer = QuantizedLinear(
+        packed_weights,
+        scales,
+        group_size=128,
+        bias=bias,
+    )
+
+    result = layer(activations)
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    expected = expected + bias
+
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_quantized_linear_cuda_rejects_noncontiguous_activations() -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = torch.randn((8, 128), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+    layer = QuantizedLinear(packed_weights, scales, group_size=128)
+    activations = torch.randn((2, 256), dtype=torch.float16, device=device)[:, :128]
+
+    with pytest.raises(ValueError, match="activations must be contiguous"):
+        layer(activations)

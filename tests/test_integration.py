@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from w4a16.integration import replace_linear_layers
@@ -48,3 +49,26 @@ def test_replace_linear_layers() -> None:
     assert isinstance(model.direct, QuantizedLinear)
     assert isinstance(model.nested[0], QuantizedLinear)
     assert torch.equal(result, expected)
+
+
+class MixedAlignmentModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.aligned = torch.nn.Linear(4, 2, bias=True, dtype=torch.float16)
+        self.nested = torch.nn.Sequential(
+            torch.nn.Linear(6, 2, bias=False, dtype=torch.float16)
+        )
+
+    def forward(self, activations: torch.Tensor) -> torch.Tensor:
+        return self.aligned(activations)
+
+
+def test_replace_linear_layers_warns_on_unaligned_in_features() -> None:
+    model = MixedAlignmentModel()
+
+    with pytest.warns(UserWarning, match=r"nested\.0"):
+        replacement_count = replace_linear_layers(model, group_size=4)
+
+    assert replacement_count == 1
+    assert isinstance(model.aligned, QuantizedLinear)
+    assert isinstance(model.nested[0], torch.nn.Linear)
