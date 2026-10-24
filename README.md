@@ -192,7 +192,10 @@ scales:         float16  [N, K / group_size]
   reuses it for every row)
 - `M = 1` decode: each lane loads 16 packed bytes per step, reads activations
   from L1 with no `__syncthreads`, and the warp reduces once at the end.
-  `W4A16_DECODE=v1` selects the original shared-memory decode kernel for A/B runs
+  Nibbles become FP16 through an exponent bit trick (one LOP3 per two weights)
+  instead of integer-to-float; multiply-adds stay FP32. `W4A16_DECODE` selects
+  the version for A/B runs: `v1` original shared-memory kernel, `v2` wide
+  loads, `v3` (default) wide loads + fast unpack
 - `QuantizedLinear` with `M > 8` or `fused=False`: dequant + cuBLAS. Calling
   `linear_cuda` directly with `M > 8`, another group size, or misaligned
   tensors uses a naive one-thread-per-output kernel

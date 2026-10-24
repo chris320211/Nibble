@@ -201,7 +201,9 @@ def test_cuda_linear_decode_misaligned_activations_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_linear_original_decode_kernel_matches_wide(
+@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
+def test_cuda_linear_decode_versions_match_reference(
+    version: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not cuda_extension_available():
@@ -213,11 +215,48 @@ def test_cuda_linear_original_decode_kernel_matches_wide(
     weights = torch.randn((2048, 2048), dtype=torch.float16, device=device)
     packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
 
-    wide = linear_cuda(activations, packed_weights, scales, group_size=128)
-    monkeypatch.setenv("W4A16_DECODE", "v1")
-    original = linear_cuda(activations, packed_weights, scales, group_size=128)
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    monkeypatch.setenv("W4A16_DECODE", version)
+    result = linear_cuda(activations, packed_weights, scales, group_size=128)
 
-    torch.testing.assert_close(wide, original, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
+def test_cuda_linear_decode_all_nibble_values_match_reference(
+    version: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    # Random bytes cover all 16 codes, including -8, in both nibbles of every
+    # byte position. The quantizer only emits [-7, 7], so this exercises the
+    # unpack paths beyond what quantized weights reach.
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((1, 1024), dtype=torch.float16, device=device)
+    packed_weights = torch.randint(
+        0, 256, (64, 512), dtype=torch.uint8, device=device
+    )
+    scales = torch.rand((64, 8), device=device).add(0.01).to(torch.float16)
+
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    monkeypatch.setenv("W4A16_DECODE", version)
+    result = linear_cuda(activations, packed_weights, scales, group_size=128)
+
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")

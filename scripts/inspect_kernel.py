@@ -136,7 +136,7 @@ def short_name(demangled: str, mangled: str) -> str:
             end = start + int(digits[index:])
             if end < len(mangled) and mangled[end] in "EI":
                 identifier = mangled[start:end]
-                template = re.match(r"ILi(\d+)EE", mangled[end:])
+                template = re.match(r"IL[ib](\d+)EE", mangled[end:])
                 return identifier + (f"<{template.group(1)}>" if template else "")
     return demangled
 
