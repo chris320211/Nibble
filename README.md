@@ -38,28 +38,33 @@ against a device-to-device copy measured on the same GPU (about 241 GB/s on a
 Colab T4; spec is 320). Weight MiB is resident FP16 storage, or packed codes +
 scales.
 
-v4 decode kernel (2 rows per warp) and FP16 cuBLAS, same run:
+v4 decode kernel (default, 4 rows per warp) and FP16 cuBLAS, same run. The T4
+ran power-capped (`sw-power`, SM 750-1290 MHz of 1590) for nearly every row,
+which is normal sustained T4 behavior:
 
 | shape (K, N) | FP16 cuBLAS us | fused us | fused vs FP16 | fused %copy | weight MiB FP16 / packed |
 | --- | --- | --- | --- | --- | --- |
-| attention-like (2048, 2048) | 40.5 | 11.6 | 3.5x faster | 77% | 8.00 / 2.06 |
-| mlp up-like (2048, 5632) | 96.3 | 26.8 | 3.6x faster | 92% | 22.00 / 5.67 |
-| mlp down-like (5632, 2048) | 94.6 | 31.2 | 3.0x faster | 79% | 22.00 / 5.67 |
+| attention-like (2048, 2048) | 38.6 | 12.5 | 3.1x faster | 72% | 8.00 / 2.06 |
+| mlp up-like (2048, 5632) | 97.4 | 28.2 | 3.5x faster | 88% | 22.00 / 5.67 |
+| mlp down-like (5632, 2048) | 95.7 | 31.6 | 3.0x faster | 78% | 22.00 / 5.67 |
 
 Packed weights are ~3.9x smaller than FP16, which caps the possible speedup for
 a memory-bound GEMV at about 3.9x. T4 has no INT4 Tensor Cores; the kernel
 unpacks nibbles and does FP32 math.
 
 Decode kernel versions (`W4A16_DECODE`), alternated twice in one session, mean
-of the two runs in us. That session's T4 was clock-throttled, so compare rows
-with each other, not with the table above:
+of the two runs in us (SM clock 690-1290 MHz, power-capped):
 
 | version | attention | mlp up | mlp down |
 | --- | --- | --- | --- |
-| v3: wide loads + fast unpack, 1 row per warp | 23.3 | 56.7 | 37.3 |
-| v4, 1 row per warp (smaller blocks only) | 23.1 | 53.7 | 42.7 |
-| v4, 2 rows per warp | 16.7 | 35.6 | 36.9 |
-| v4, 4 rows per warp (default) | 17.2 | 31.6 | 34.6 |
+| v3: wide loads + fast unpack, 1 row per warp | 28.0 | 37.1 | 38.7 |
+| v4, 1 row per warp (smaller blocks only) | 25.2 | 38.4 | 38.3 |
+| v4, 2 rows per warp | 18.3 | 26.9 | 30.7 |
+| v4, 4 rows per warp (default) | 18.1 | 27.9 | 30.9 |
+
+Sharing rows cuts 25-35% against v3; smaller blocks alone do not. 2 and 4 rows
+per warp tie within noise (an earlier session had 4 ahead by ~10% on the MLP
+shapes; this one has them within ~4%).
 
 Earlier steps, each measured against the previous version in its own session:
 v1 (original, 2-byte loads, two `__syncthreads` per group) took 43.8 / 100.8 /
@@ -74,37 +79,38 @@ change, so this compute-heavy kernel slows down more than cuBLAS. The table's
 
 ### TinyLlama generate
 
-> **Stale.** The table below predates the v2–v4 decode kernels (it used the
-> original v1 kernel), is a single cold run with no warmup, and FP16 `2+2`
-> stopped at 9 tokens, so the rows are not comparable. It will be replaced
-> with numbers from the current `scripts/generate.py` (see
-> [Generate benchmark methodology](#generate-benchmark-methodology)).
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, chat template, `max_new_tokens =
+32` forced (every mode decodes 32 tokens), 1 warmup + median of 5 runs (see
+[Generate benchmark methodology](#generate-benchmark-methodology)). Fused: v4
+`M = 1` kernel for decode, dequant + cuBLAS for prefill (`M > 8`). FP16 and
+bnb-nf4 load Hugging Face weights; fused and dequant load packed weights only
+(155 layers). bnb-nf4 is from a `--mode all` run in the same session.
 
-`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
-template. Fused: `M = 1` kernel, `M > 1` dequant+cuBLAS. FP16 loads Hugging Face
-weights; fused/dequant load packed weights only (155 layers). `tok/s` =
-`1000 * new_tokens / generate_ms` (includes prefill). One run, no generate
-warmup.
+| mode | prompt | prefill ms | decode ms | decode tok/s | e2e tok/s | allocated MiB | peak MiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| FP16 | haiku | 31.4 | 830.4 | 37.33 | 37.13 | 2100.18 | 2111.17 |
+| FP16 | 2+2 | 34.3 | 841.3 | 36.85 | 36.54 | 2100.18 | 2111.17 |
+| bnb-nf4 | haiku | 48.0 | 1370.2 | 22.62 | 22.56 | 798.00 | 800.87 |
+| bnb-nf4 | 2+2 | 50.9 | 1374.1 | 22.56 | 22.46 | 798.00 | 800.87 |
+| dequant | haiku | 182.9 | 5508.0 | 5.63 | 5.62 | 642.59 | 1216.60 |
+| dequant | 2+2 | 186.2 | 5516.4 | 5.62 | 5.61 | 642.59 | 1216.60 |
+| fused | haiku | 171.6 | 827.5 | 37.46 | 32.03 | 642.59 | 751.37 |
+| fused | 2+2 | 171.8 | 839.2 | 36.94 | 31.65 | 642.59 | 751.37 |
 
-Prompts: `Write a short haiku about GPUs.` and `What is 2+2?`
-
-| prompt | baseline | tokens | ms | tok/s | allocated MiB | peak MiB |
-| --- | --- | --- | --- | --- | --- | --- |
-| haiku | FP16 | 32 | 2206.9 | 14.50 | 2100.18 | 2111.05 |
-| haiku | dequant | 32 | 5898.9 | 5.42 | 642.59 | 1216.48 |
-| haiku | fused | 32 | 1326.1 | 24.13 | 642.59 | 751.22 |
-| 2+2 | FP16 | 9 | 232.2 | 38.76 | 2100.18 | 2111.05 |
-| 2+2 | dequant | 32 | 5614.7 | 5.70 | 642.59 | 1216.48 |
-| 2+2 | fused | 32 | 971.5 | 32.94 | 642.59 | 751.22 |
-
-- Packed load: **643 MiB** vs **2100 MiB** FP16 (~3.3× smaller). Fused peak
-  **751 MiB** vs **2111 MiB** (~2.8× less). Dequant peaks higher because every
-  call unpacks a full matrix (`lm_head` is largest).
-- Haiku fused is ~4.5× faster than dequant. Compare haiku rows for tok/s (all
-  32 tokens). FP16 `2+2` stopped at 9 tokens.
-- FP16 haiku (14.50 tok/s) is a cold first generate after `from_pretrained`;
-  the next FP16 prompt is 38.76 tok/s. Fused is not faster than warm FP16.
-- Fused and dequant greedy text matched; FP16 wording differed (quantization).
+- **Decode is CPU-bound, so the faster kernel does not show up in tok/s.** One
+  token takes ~27 ms, but streaming all FP16 weights takes the GPU only ~8.5 ms
+  (~2.0 GB at ~240 GB/s) and the packed weights ~2.5-3 ms. The rest is Python
+  and Hugging Face launching hundreds of small ops one at a time while the GPU
+  waits, so fused and FP16 decode both run at ~37 tok/s. CUDA graphs
+  (`torch.compile(mode="reduce-overhead")` with a static KV cache) would remove
+  that overhead and expose the kernel difference.
+- Fused decode is ~1.7x bitsandbytes NF4 (37.5 vs 22.6 tok/s) and ~6.7x
+  dequant every call, with the least memory: **643 MiB** allocated vs **2100
+  MiB** FP16 (~3.3x smaller) and 798 MiB NF4 (NF4 keeps `lm_head` in FP16).
+- Fused prefill (~172 ms vs ~31 ms FP16) is the Python dequant + cuBLAS path for
+  `M > 8`; it is not the fused kernel.
+- Fused and dequant greedy text match each other; FP16 and NF4 wording differs
+  (quantization).
 
 Colab: `notebooks/colab_t4.ipynb`.
 

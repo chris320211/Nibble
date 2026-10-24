@@ -429,8 +429,8 @@ DecodeVersion selected_decode_version() {
 }
 
 
-// Output rows per warp for v4, from W4A16_ROWS_PER_WARP (default 4; 4 beat 2
-// by ~10% on the TinyLlama MLP shapes and lost ~3% on attention on a T4).
+// Output rows per warp for v4, from W4A16_ROWS_PER_WARP (default 4). On a T4,
+// 2 and 4 tie within noise across sessions; both beat 1 by 25-35%.
 int selected_rows_per_warp() {
     const char* choice = std::getenv("W4A16_ROWS_PER_WARP");
     if (choice == nullptr) {
