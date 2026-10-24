@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from w4a16.cuda import cuda_extension_available, dequantize_cuda, linear_cuda
+from w4a16.linear import QuantizedLinear
 from w4a16.quantization import quantize_and_pack_weights
 from w4a16.reference import dequantize_weights, linear_reference
 
@@ -528,3 +529,28 @@ def test_dequantize_cuda_rejects_group_size_not_multiple_of_32() -> None:
 
     with pytest.raises(RuntimeError):
         dequantize_cuda(packed_weights, scales, 48)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("rows", [1, 4, 24])
+def test_quantized_linear_traces_under_torch_compile(rows: int) -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    # aot_eager traces with fake tensors (needs the register_fake impls in
+    # w4a16.cuda) without compiling Triton kernels, so the test stays fast.
+    # rows 1 / 4 / 24 cover the decode, small-batch, and dequant + cuBLAS paths.
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = torch.randn((256, 512), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+    layer = QuantizedLinear(packed_weights, scales, group_size=128)
+    activations = torch.randn((rows, 512), dtype=torch.float16, device=device)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(layer, backend="aot_eager", fullgraph=True)
+    with torch.inference_mode():
+        expected = layer(activations)
+        result = compiled(activations)
+
+    torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)

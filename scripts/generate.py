@@ -18,6 +18,13 @@ Timing methodology, per mode and prompt:
    --runs timed generates forced to exactly --max-new-tokens tokens, so every
    mode decodes the same number of tokens. Medians are reported.
 decode_ms = total_ms - prefill_ms. decode tok/s = (new_tokens - 1) / decode_s.
+
+Eager Hugging Face decode is CPU-bound on a T4: each token launches hundreds of
+small ops from Python, and the GPU waits between them, so a faster linear
+kernel barely changes tok/s. --cuda-graphs passes cache_implementation="static";
+transformers then torch.compiles the decode step with mode="reduce-overhead",
+which replays each token as one CUDA graph. Prefill stays eager. The first
+generate per prompt compiles (slow); the untimed text run and warmup absorb it.
 """
 
 import argparse
@@ -34,6 +41,7 @@ if str(_REPO_ROOT) not in sys.path:
 import importlib.util
 
 import torch
+import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from w4a16 import cuda_extension_available, load_packed_state_dict
@@ -92,6 +100,14 @@ def parse_args() -> argparse.Namespace:
         help="Timed generates per prompt for prefill and for total (default: 5).",
     )
     parser.add_argument("--prompt", action="append", dest="prompts")
+    parser.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help=(
+            "Static KV cache + torch.compile(mode='reduce-overhead') for decode "
+            "steps, removing per-op Python launch overhead."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -222,12 +238,17 @@ def timed_generate(
     fixed_length: bool,
     pad_token_id: int,
     device: str,
+    cuda_graphs: bool,
 ) -> tuple[torch.Tensor, float]:
     """Run one greedy generate and return output ids and elapsed milliseconds."""
     kwargs = {}
     if fixed_length:
         # Ignore EOS so every mode decodes exactly max_new_tokens tokens.
         kwargs["min_new_tokens"] = max_new_tokens
+    if cuda_graphs:
+        # A static cache makes decode shapes fixed, which is what lets
+        # transformers auto-compile the decode step into a CUDA graph.
+        kwargs["cache_implementation"] = "static"
 
     if device == "cuda":
         torch.cuda.synchronize()
@@ -265,6 +286,7 @@ def benchmark_prompt(
     warmup: int,
     runs: int,
     device: str,
+    cuda_graphs: bool,
 ) -> dict:
     encoded = encode_prompt(tokenizer, prompt, device)
     prompt_length = encoded["input_ids"].shape[-1]
@@ -276,21 +298,23 @@ def benchmark_prompt(
 
     # Untimed text run (stops at EOS); doubles as the first warmup.
     output_ids, _ = timed_generate(
-        model, encoded, max_new_tokens, False, pad_token_id, device
+        model, encoded, max_new_tokens, False, pad_token_id, device, cuda_graphs
     )
     text = tokenizer.decode(output_ids[0, prompt_length:], skip_special_tokens=True)
     for _ in range(warmup):
-        timed_generate(model, encoded, max_new_tokens, True, pad_token_id, device)
+        timed_generate(
+            model, encoded, max_new_tokens, True, pad_token_id, device, cuda_graphs
+        )
 
     prefill_samples = [
-        timed_generate(model, encoded, 1, True, pad_token_id, device)[1]
+        timed_generate(model, encoded, 1, True, pad_token_id, device, cuda_graphs)[1]
         for _ in range(runs)
     ]
     total_samples: list[float] = []
     new_tokens = 0
     for _ in range(runs):
         output_ids, elapsed_ms = timed_generate(
-            model, encoded, max_new_tokens, True, pad_token_id, device
+            model, encoded, max_new_tokens, True, pad_token_id, device, cuda_graphs
         )
         new_tokens = int(output_ids.shape[-1] - prompt_length)
         total_samples.append(elapsed_ms)
@@ -401,6 +425,10 @@ def run_mode(
         print(f"allocated_mib: {allocated_mib:.2f}")
         torch.cuda.reset_peak_memory_stats()
     print(f"warmup: {args.warmup}  runs: {args.runs}  (medians reported)")
+    print(
+        "cuda_graphs: "
+        + ("requested (static cache, compiled decode)" if args.cuda_graphs else "off")
+    )
 
     rows: list[dict] = []
     for prompt in prompts:
@@ -412,6 +440,7 @@ def run_mode(
             args.warmup,
             args.runs,
             args.device,
+            args.cuda_graphs,
         )
         print(f"prompt: {prompt}")
         print(f"output: {row['text']}")
@@ -431,6 +460,15 @@ def run_mode(
         row["peak_mib"] = None
         rows.append(row)
 
+    if args.cuda_graphs:
+        # transformers stores the compiled forward here once it auto-compiles;
+        # if it is missing, decode ran eagerly (e.g. bitsandbytes is not
+        # compileable) and the timings are not CUDA-graph numbers.
+        compiled = hasattr(model, "_compiled_call")
+        print(f"decode_compiled: {'yes' if compiled else 'no (ran eager)'}")
+        for row in rows:
+            row["mode"] = f"{mode}+graphs" if compiled else f"{mode}+static"
+
     peak_mib = None
     if args.device == "cuda":
         peak_mib = torch.cuda.max_memory_allocated() / BYTES_PER_MIB
@@ -447,6 +485,9 @@ def run_mode(
 
 def main() -> None:
     args = parse_args()
+    # Hugging Face warns on every generate call that both max_new_tokens and the
+    # checkpoint's max_length are set; that buries the timing output.
+    transformers.logging.set_verbosity_error()
     if args.max_new_tokens < 2:
         raise ValueError("max_new_tokens must be at least 2 to time decode")
     if args.warmup < 0:

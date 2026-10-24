@@ -136,6 +136,7 @@ python scripts/generate.py --mode dequant --checkpoint checkpoints/tinyllama-w4a
 python scripts/generate.py --mode fused --checkpoint checkpoints/tinyllama-w4a16.pt
 python scripts/generate.py --mode bnb-nf4
 python scripts/generate.py --mode all --checkpoint checkpoints/tinyllama-w4a16.pt
+python scripts/generate.py --mode fused --checkpoint checkpoints/tinyllama-w4a16.pt --cuda-graphs
 python scripts/benchmark.py --m 1 2 4 8
 python scripts/profile_kernel.py --baselines fused resident_fp16
 ```

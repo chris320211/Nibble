@@ -11,6 +11,31 @@ else:
     _EXTENSION_LOAD_ERROR = None
 
 
+if _EXTENSION_LOAD_ERROR is None:
+    # Fake (meta) implementations: output shape and dtype only. torch.compile
+    # traces the model with fake tensors, so it needs these to see through the
+    # C++ ops (e.g. generate with a static cache and CUDA graphs).
+    @torch.library.register_fake("w4a16::linear")
+    def _linear_fake(
+        activations: torch.Tensor,
+        packed_weights: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> torch.Tensor:
+        return activations.new_empty((activations.shape[0], packed_weights.shape[0]))
+
+    @torch.library.register_fake("w4a16::dequantize")
+    def _dequantize_fake(
+        packed_weights: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> torch.Tensor:
+        return packed_weights.new_empty(
+            (packed_weights.shape[0], packed_weights.shape[1] * 2),
+            dtype=torch.float16,
+        )
+
+
 def cuda_extension_available() -> bool:
     """Return whether the compiled W4A16 CUDA extension can be loaded."""
     return _EXTENSION_LOAD_ERROR is None
