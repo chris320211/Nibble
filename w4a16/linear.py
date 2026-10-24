@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from w4a16.cuda import linear_cuda
+from w4a16.cuda import cuda_extension_available, dequantize_cuda, linear_cuda
 from w4a16.quantization import quantize_and_pack_weights
 from w4a16.reference import dequantize_weights, linear_reference
 
@@ -130,11 +130,25 @@ class QuantizedLinear(torch.nn.Module):
         )
 
     def _dequant_linear(self, activations: torch.Tensor) -> torch.Tensor:
-        weight = dequantize_weights(
-            self.packed_weights,
-            self.scales,
-            self.group_size,
-        ).to(dtype=torch.float16)
+        # The CUDA dequantize kernel makes the FP16 matrix in one pass; the
+        # Python path below makes several full-size passes (int8, float32) and
+        # dominated prefill time. Both produce identical FP16 weights.
+        if (
+            self.packed_weights.is_cuda
+            and cuda_extension_available()
+            and self.group_size % 32 == 0
+        ):
+            weight = dequantize_cuda(
+                self.packed_weights,
+                self.scales,
+                self.group_size,
+            )
+        else:
+            weight = dequantize_weights(
+                self.packed_weights,
+                self.scales,
+                self.group_size,
+            ).to(dtype=torch.float16)
         return F.linear(activations, weight)
 
     def forward(self, activations: torch.Tensor) -> torch.Tensor:

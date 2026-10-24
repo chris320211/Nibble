@@ -2,7 +2,7 @@ from w4a16.checkpoint import (
     load_quantized_weight_checkpoint,
     save_quantized_weight_checkpoint,
 )
-from w4a16.cuda import cuda_extension_available, linear_cuda
+from w4a16.cuda import cuda_extension_available, dequantize_cuda, linear_cuda
 from w4a16.integration import load_packed_state_dict, replace_linear_layers
 from w4a16.linear import QuantizedLinear
 from w4a16.quantization import (
@@ -23,5 +23,6 @@ __all__ = [
     "replace_linear_layers",
     "load_packed_state_dict",
     "linear_cuda",
+    "dequantize_cuda",
     "cuda_extension_available",
 ]

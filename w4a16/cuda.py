@@ -16,6 +16,14 @@ def cuda_extension_available() -> bool:
     return _EXTENSION_LOAD_ERROR is None
 
 
+def _require_extension() -> None:
+    if _EXTENSION_LOAD_ERROR is not None:
+        raise RuntimeError(
+            "The W4A16 CUDA extension is not built. Build it with "
+            "`python setup.py build_ext --inplace`."
+        ) from _EXTENSION_LOAD_ERROR
+
+
 def linear_cuda(
     activations: torch.Tensor,
     packed_weights: torch.Tensor,
@@ -27,15 +35,24 @@ def linear_cuda(
     group_size=128 uses the warp-per-channel kernels (M=1 decode, M=2..8 small
     batch). Other shapes fall back to the naive one-thread-per-output kernel.
     """
-    if _EXTENSION_LOAD_ERROR is not None:
-        raise RuntimeError(
-            "The W4A16 CUDA extension is not built. Build it with "
-            "`python setup.py build_ext --inplace`."
-        ) from _EXTENSION_LOAD_ERROR
-
+    _require_extension()
     return torch.ops.w4a16.linear(
         activations,
         packed_weights,
         scales,
         group_size,
     )
+
+
+def dequantize_cuda(
+    packed_weights: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Unpack INT4 weights to an FP16 [N, K] matrix in one CUDA pass.
+
+    Bit-identical to ``dequantize_weights(...).to(torch.float16)``. Needs
+    group_size to be a multiple of 32 and 16-byte aligned packed weights.
+    """
+    _require_extension()
+    return torch.ops.w4a16.dequantize(packed_weights, scales, group_size)

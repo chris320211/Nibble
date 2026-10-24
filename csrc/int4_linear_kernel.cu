@@ -404,6 +404,53 @@ __global__ void int4_linear_kernel_decode_multirow(
 }
 
 
+__device__ __forceinline__ uint32_t half2_to_bits(__half2 value) {
+    return *reinterpret_cast<const uint32_t*>(&value);
+}
+
+
+// Packed INT4 -> FP16 weights [N, K] in one pass, for prefill (M > 8) where
+// cuBLAS does the matmul. Each thread unpacks one 16-byte chunk (32 weights,
+// all in one group, so one scale) with unpack8_fast and writes 64 bytes.
+// weight * scale is a single FP16 multiply, which rounds exactly like the FP32
+// product cast to FP16 that dequantize_weights(...).to(float16) computes (the
+// FP32 product of a 4-bit integer and an FP16 scale is exact), so the output is
+// bit-identical to the Python path.
+__global__ void int4_dequantize_kernel(
+    const uint8_t* __restrict__ packed_weights,
+    const __half* __restrict__ scales,
+    __half* __restrict__ weights,
+    int64_t number_of_chunks,
+    int64_t chunks_per_row,
+    int64_t chunks_per_group,
+    int64_t groups_per_row) {
+    const int64_t chunk = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (chunk >= number_of_chunks) {
+        return;
+    }
+
+    const int64_t row = chunk / chunks_per_row;
+    const int64_t group = (chunk % chunks_per_row) / chunks_per_group;
+    const __half2 scale = __half2half2(scales[row * groups_per_row + group]);
+    const uint4 packed = reinterpret_cast<const uint4*>(packed_weights)[chunk];
+    const uint32_t packed_words[4] = {packed.x, packed.y, packed.z, packed.w};
+    uint4* output_chunk = reinterpret_cast<uint4*>(weights) + chunk * 4;
+
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        // unpack8_fast pairs (w0, w4), (w1, w5), (w2, w6), (w3, w7); memory
+        // order needs (w0, w1), (w2, w3), (w4, w5), (w6, w7).
+        __half2 pairs[4];
+        unpack8_fast(packed_words[word], pairs);
+        output_chunk[word] = make_uint4(
+            half2_to_bits(__hmul2(__lows2half2(pairs[0], pairs[1]), scale)),
+            half2_to_bits(__hmul2(__lows2half2(pairs[2], pairs[3]), scale)),
+            half2_to_bits(__hmul2(__highs2half2(pairs[0], pairs[1]), scale)),
+            half2_to_bits(__hmul2(__highs2half2(pairs[2], pairs[3]), scale)));
+    }
+}
+
+
 bool is_16_byte_aligned(const void* pointer) {
     return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
 }
@@ -752,4 +799,69 @@ at::Tensor int4_linear_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return output;
+}
+
+
+at::Tensor int4_dequantize_cuda(
+    const at::Tensor& packed_weights,
+    const at::Tensor& scales,
+    int64_t group_size) {
+    TORCH_CHECK(packed_weights.is_cuda(), "packed_weights must be a CUDA tensor");
+    TORCH_CHECK(scales.is_cuda(), "scales must be a CUDA tensor");
+    TORCH_CHECK(
+        packed_weights.device() == scales.device(),
+        "packed_weights and scales must be on the same CUDA device");
+    TORCH_CHECK(
+        packed_weights.scalar_type() == at::kByte,
+        "packed_weights must have dtype torch.uint8");
+    TORCH_CHECK(
+        scales.scalar_type() == at::kHalf,
+        "scales must have dtype torch.float16");
+    TORCH_CHECK(
+        packed_weights.dim() == 2,
+        "packed_weights must have shape [N, K / 2]");
+    TORCH_CHECK(scales.dim() == 2, "scales must have shape [N, K / group_size]");
+    TORCH_CHECK(packed_weights.is_contiguous(), "packed_weights must be contiguous");
+    TORCH_CHECK(scales.is_contiguous(), "scales must be contiguous");
+    TORCH_CHECK(
+        group_size > 0 && group_size % 32 == 0,
+        "dequantize needs group_size to be a positive multiple of 32");
+    TORCH_CHECK(
+        is_16_byte_aligned(packed_weights.data_ptr()),
+        "packed_weights must be 16-byte aligned");
+
+    const int64_t output_features = packed_weights.size(0);
+    const int64_t input_features = packed_weights.size(1) * 2;
+    TORCH_CHECK(
+        input_features % group_size == 0,
+        "K must be divisible by group_size");
+    TORCH_CHECK(
+        scales.size(0) == output_features &&
+            scales.size(1) == input_features / group_size,
+        "scales must have shape [N, K / group_size]");
+
+    const c10::cuda::CUDAGuard device_guard(packed_weights.device());
+    at::Tensor weights = at::empty(
+        {output_features, input_features},
+        packed_weights.options().dtype(at::kHalf));
+    const int64_t number_of_chunks = output_features * input_features / 32;
+    if (number_of_chunks == 0) {
+        return weights;
+    }
+
+    constexpr int threads_per_block = 256;
+    const int blocks = static_cast<int>(
+        (number_of_chunks + threads_per_block - 1) / threads_per_block);
+    int4_dequantize_kernel<<<
+        blocks, threads_per_block, 0, at::cuda::getCurrentCUDAStream().stream()>>>(
+        packed_weights.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(weights.data_ptr<at::Half>()),
+        number_of_chunks,
+        input_features / 32,
+        group_size / 32,
+        input_features / group_size);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return weights;
 }

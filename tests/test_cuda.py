@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from w4a16.cuda import cuda_extension_available, linear_cuda
+from w4a16.cuda import cuda_extension_available, dequantize_cuda, linear_cuda
 from w4a16.quantization import quantize_and_pack_weights
-from w4a16.reference import linear_reference
+from w4a16.reference import dequantize_weights, linear_reference
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
@@ -475,3 +475,56 @@ def test_cuda_linear_above_small_batch_uses_naive_and_matches_reference() -> Non
     )
 
     torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize(("k", "n"), [(256, 8), (2048, 2048), (2048, 5632), (5632, 2048)])
+def test_dequantize_cuda_is_bit_identical_to_reference(
+    group_size: int,
+    k: int,
+    n: int,
+) -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = torch.randn((n, k), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=group_size)
+
+    expected = dequantize_weights(packed_weights, scales, group_size).to(torch.float16)
+    result = dequantize_cuda(packed_weights, scales, group_size)
+
+    assert result.dtype == torch.float16
+    assert torch.equal(result, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_dequantize_cuda_all_nibble_values_bit_identical() -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    # Random bytes hit all 16 codes (including -8) in every nibble position.
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    packed_weights = torch.randint(0, 256, (64, 512), dtype=torch.uint8, device=device)
+    scales = torch.rand((64, 8), device=device).add(0.01).to(torch.float16)
+
+    expected = dequantize_weights(packed_weights, scales, 128).to(torch.float16)
+    result = dequantize_cuda(packed_weights, scales, 128)
+
+    assert torch.equal(result, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_dequantize_cuda_rejects_group_size_not_multiple_of_32() -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    device = torch.device("cuda")
+    weights = torch.randn((8, 96), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=48)
+
+    with pytest.raises(RuntimeError):
+        dequantize_cuda(packed_weights, scales, 48)

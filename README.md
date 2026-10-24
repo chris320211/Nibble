@@ -107,8 +107,10 @@ bnb-nf4 load Hugging Face weights; fused and dequant load packed weights only
 - Fused decode is ~1.7x bitsandbytes NF4 (37.5 vs 22.6 tok/s) and ~6.7x
   dequant every call, with the least memory: **643 MiB** allocated vs **2100
   MiB** FP16 (~3.3x smaller) and 798 MiB NF4 (NF4 keeps `lm_head` in FP16).
-- Fused prefill (~172 ms vs ~31 ms FP16) is the Python dequant + cuBLAS path for
-  `M > 8`; it is not the fused kernel.
+- Fused prefill (~172 ms vs ~31 ms FP16) and the dequant row were measured with
+  the old Python dequant (several full-size int8/float32 passes per layer).
+  Prefill and dequant mode now use the one-pass CUDA dequantize kernel; these
+  rows will be re-measured.
 - Fused and dequant greedy text match each other; FP16 and NF4 wording differs
   (quantization).
 
@@ -227,7 +229,9 @@ scales:         float16  [N, K / group_size]
   each activation load and conversion across them. `W4A16_DECODE` selects the
   version for A/B runs: `v1` original shared-memory kernel, `v2` wide loads,
   `v3` wide loads + fast unpack, `v4` (default) v3 with several rows per warp
-- `QuantizedLinear` with `M > 8` or `fused=False`: dequant + cuBLAS. Calling
+- `QuantizedLinear` with `M > 8` or `fused=False`: CUDA dequantize kernel (one
+  pass to an FP16 `[N, K]` matrix, bit-identical to the Python
+  `dequantize_weights`, needs `group_size % 32 == 0`) + cuBLAS. Calling
   `linear_cuda` directly with `M > 8`, another group size, or misaligned
   tensors uses a naive one-thread-per-output kernel
 - No autograd. Bias, if any, is added in Python after the op
@@ -241,6 +245,7 @@ scales:         float16  [N, K / group_size]
 | `replace_linear_layers` | Replace compatible `nn.Linear`; `packed_only=True` skips quantize |
 | `load_packed_state_dict` | Empty-replace, `to_empty`, load packed weights |
 | `linear_cuda` | Fused CUDA op |
+| `dequantize_cuda` | Packed weights + scales → FP16 `[N, K]` on the GPU |
 | `cuda_extension_available` | Whether `w4a16._C` loaded |
 | `save_quantized_weight_checkpoint` | One packed tensor + metadata |
 | `load_quantized_weight_checkpoint` | Load and validate one packed tensor |
