@@ -429,11 +429,12 @@ DecodeVersion selected_decode_version() {
 }
 
 
-// Output rows per warp for v4, from W4A16_ROWS_PER_WARP (default 2).
+// Output rows per warp for v4, from W4A16_ROWS_PER_WARP (default 4; 4 beat 2
+// by ~10% on the TinyLlama MLP shapes and lost ~3% on attention on a T4).
 int selected_rows_per_warp() {
     const char* choice = std::getenv("W4A16_ROWS_PER_WARP");
     if (choice == nullptr) {
-        return 2;
+        return 4;
     }
     const int rows = std::atoi(choice);
     TORCH_CHECK(

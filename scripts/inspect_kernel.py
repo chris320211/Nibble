@@ -5,7 +5,8 @@ GPU performance counters (works on Colab where ncu fails). Opcode counts are
 static (instructions in the binary), not executed counts: an instruction inside
 the K loop runs once per iteration. Read the dumped SASS to see the loop body.
 
-Occupancy assumes sm_75 limits and the launch's threads per block (256).
+Occupancy assumes sm_75 limits and each kernel's launch block size
+(LAUNCH_THREADS_PER_BLOCK, matching int4_linear_kernel.cu).
 """
 
 import argparse
@@ -23,6 +24,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 KERNEL_PREFIX = "int4_linear_kernel"
+DEFAULT_THREADS_PER_BLOCK = 256
+# Kernels launched with a block size other than the default, by name substring.
+LAUNCH_THREADS_PER_BLOCK = {"decode_multirow": 128}
 CUDA_BIN = Path("/usr/local/cuda/bin")
 
 # sm_75 (Turing) per-SM limits.
@@ -76,8 +80,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threads-per-block",
         type=int,
-        default=256,
-        help="Threads per block used by the launches (default: 256).",
+        default=None,
+        help=(
+            "Override threads per block for every kernel (default: each "
+            "kernel's real launch size, 128 for decode_multirow, else 256)."
+        ),
     )
     parser.add_argument(
         "--filter",
@@ -183,6 +190,13 @@ def global_load_widths(counts: Counter[str]) -> str:
     return ", ".join(f"{opcode} x{count}" for opcode, count in sorted(widths.items()))
 
 
+def launch_threads_per_block(kernel: str) -> int:
+    for name, threads in LAUNCH_THREADS_PER_BLOCK.items():
+        if name in kernel:
+            return threads
+    return DEFAULT_THREADS_PER_BLOCK
+
+
 def occupancy(resources: Resources, threads_per_block: int) -> tuple[int, float, str]:
     """Return (blocks per SM, occupancy fraction, limiting resource)."""
     warps_per_block = math.ceil(threads_per_block / 32)
@@ -237,13 +251,14 @@ def main() -> None:
         print(f"\n== {kernel}")
         resource = resources.get(mangled)
         if resource is not None:
-            blocks, fraction, limiter = occupancy(resource, args.threads_per_block)
+            threads_per_block = args.threads_per_block or launch_threads_per_block(kernel)
+            blocks, fraction, limiter = occupancy(resource, threads_per_block)
             print(
                 f"  registers {resource.registers}  shared {resource.shared} B  "
                 f"stack {resource.stack} B  local (spills) {resource.local} B"
             )
             print(
-                f"  occupancy at {args.threads_per_block} threads/block: "
+                f"  occupancy at {threads_per_block} threads/block: "
                 f"{blocks} blocks/SM, {100 * fraction:.0f}% warps (limited by {limiter})"
             )
         print(f"  instructions {sum(counts.values())}  (static)")

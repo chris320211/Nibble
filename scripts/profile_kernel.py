@@ -15,7 +15,10 @@ scales + activations + output. FP16 payload is N*K*2 + activations + output.
 
 import argparse
 import math
+import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,11 +68,40 @@ SHAPES: list[tuple[str, int, int]] = [
 ]
 
 BASELINE_ORDER = ("resident_fp16", "dequant_every_call", "fused")
+
+# GPU state is sampled with nvidia-smi while extra calls keep the GPU busy, so
+# the clock reflects load, not idle. T4 drops its SM clock under its 70 W cap or
+# when hot; memory clock stays put, so compute-heavy kernels slow down more.
+LOAD_SECONDS = 0.5
+SAMPLE_DELAY_SECONDS = 0.2
+NVIDIA_SMI_FIELDS = "clocks.sm,clocks.max.sm,temperature.gpu,power.draw"
+# Newer drivers renamed clocks_throttle_reasons to clocks_event_reasons.
+NVIDIA_SMI_REASON_FIELDS = (
+    "clocks_event_reasons.active",
+    "clocks_throttle_reasons.active",
+)
+THROTTLE_REASONS = {
+    0x2: "app-clocks",
+    0x4: "sw-power",
+    0x8: "hw-slowdown",
+    0x20: "sw-thermal",
+    0x40: "hw-thermal",
+    0x80: "power-brake",
+}
 NVTX_NAMES = {
     "resident_fp16": "w4a16_fp16",
     "dequant_every_call": "w4a16_dequant",
     "fused": "w4a16_fused",
 }
+
+
+@dataclass(frozen=True)
+class GpuState:
+    sm_mhz: int
+    max_sm_mhz: int
+    temperature_c: int
+    power_w: float
+    throttle: str
 
 
 @dataclass(frozen=True)
@@ -88,6 +120,7 @@ class Row:
     pct_peak: float | None
     pct_copy: float
     intensity: float
+    gpu_state: GpuState | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,6 +225,65 @@ def spec_dram_gbs(device_name: str) -> float | None:
 def l2_cache_bytes() -> int:
     properties = torch.cuda.get_device_properties(0)
     return int(getattr(properties, "L2_cache_size", 0)) or DEFAULT_L2_BYTES
+
+
+def decode_throttle(mask: int) -> str:
+    names = [name for bit, name in THROTTLE_REASONS.items() if mask & bit]
+    return "+".join(names) if names else "none"
+
+
+def query_gpu_state() -> GpuState | None:
+    """One nvidia-smi sample of SM clock, temperature, power, throttle reasons."""
+    for reason_field in NVIDIA_SMI_REASON_FIELDS:
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    f"--query-gpu={NVIDIA_SMI_FIELDS},{reason_field}",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    "0",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            sm, max_sm, temperature, power, reasons = (
+                field.strip() for field in result.stdout.strip().split(",")
+            )
+            return GpuState(
+                sm_mhz=int(sm),
+                max_sm_mhz=int(max_sm),
+                temperature_c=int(temperature),
+                # power.draw reads "[N/A]" on some boards; keep the other fields.
+                power_w=float(power) if power[:1].isdigit() else math.nan,
+                throttle=decode_throttle(int(reasons, 16)),
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    return None
+
+
+def sample_gpu_state_under_load(launch: Callable[[], None], launch_us: float) -> GpuState | None:
+    """Keep the GPU busy for LOAD_SECONDS and sample nvidia-smi partway through."""
+    samples: list[GpuState | None] = []
+
+    def sample_later() -> None:
+        time.sleep(SAMPLE_DELAY_SECONDS)
+        samples.append(query_gpu_state())
+
+    sampler = threading.Thread(target=sample_later)
+    sampler.start()
+    deadline = time.perf_counter() + LOAD_SECONDS
+    # Launch in small batches and sync so the queue never runs far past the deadline.
+    batch = max(1, int(10_000 / max(launch_us, 1.0)))
+    while time.perf_counter() < deadline:
+        for _ in range(batch):
+            launch()
+        torch.cuda.synchronize()
+    sampler.join()
+    return samples[0] if samples else None
 
 
 def payload_bytes(baseline: str, m: int, k: int, n: int, group_size: int) -> int:
@@ -365,8 +457,11 @@ def measure(
     calls: int,
     use_graph: bool,
     use_cuda_profiler: bool,
-) -> tuple[float, float, str]:
-    """Return (kernel_us, eager_us, timing mode). Warmup is outside the profiler window."""
+) -> tuple[float, float, str, GpuState | None]:
+    """Return (kernel_us, eager_us, timing mode, GPU state under load).
+
+    Warmup and the GPU-state sample are outside the profiler window.
+    """
     for _ in range(warmup):
         run_calls(operations, len(operations))
     torch.cuda.synchronize()
@@ -390,7 +485,8 @@ def measure(
     launch()
     torch.cuda.synchronize()
     kernel_us = median(time_samples_us(launch, calls, iters, use_cuda_profiler))
-    return kernel_us, eager_us, timing
+    gpu_state = sample_gpu_state_under_load(launch, kernel_us * calls)
+    return kernel_us, eager_us, timing, gpu_state
 
 
 def measure_copy_gbs(device: torch.device, iters: int = 20) -> float:
@@ -453,7 +549,7 @@ def run_one(
     )
     operations = make_operations(baseline, x, k, n, copies, device)
 
-    kernel_us, eager_us, timing = measure(
+    kernel_us, eager_us, timing, gpu_state = measure(
         operations,
         args.warmup,
         args.iters,
@@ -492,6 +588,7 @@ def run_one(
         pct_peak=pct_peak,
         pct_copy=pct_copy,
         intensity=intensity,
+        gpu_state=gpu_state,
     )
 
 
@@ -511,6 +608,9 @@ def format_table(rows: list[Row]) -> str:
         "%peak",
         "%copy",
         "AI",
+        "sm_mhz",
+        "temp_c",
+        "throttle",
     )
     table_rows = [
         (
@@ -528,6 +628,9 @@ def format_table(rows: list[Row]) -> str:
             "-" if row.pct_peak is None else f"{row.pct_peak:.1f}",
             f"{row.pct_copy:.1f}",
             f"{row.intensity:.2f}",
+            "-" if row.gpu_state is None else str(row.gpu_state.sm_mhz),
+            "-" if row.gpu_state is None else str(row.gpu_state.temperature_c),
+            "-" if row.gpu_state is None else row.gpu_state.throttle,
         )
         for row in rows
     ]
@@ -583,6 +686,15 @@ def main() -> None:
     dram_gbs = args.dram_gbs if args.dram_gbs is not None else spec_dram_gbs(device_name)
     l2_bytes = l2_cache_bytes()
     copy_gbs = measure_copy_gbs(device)
+    idle_state = query_gpu_state()
+    if idle_state is None:
+        gpu_state_line = "GPU state: nvidia-smi unavailable; sm_mhz/temp_c/throttle left blank."
+    else:
+        gpu_state_line = (
+            f"GPU state at start: SM {idle_state.sm_mhz}/{idle_state.max_sm_mhz} MHz  "
+            f"{idle_state.temperature_c} C  {idle_state.power_w:.0f} W  "
+            f"throttle {idle_state.throttle}"
+        )
 
     header = [
         "W4A16 decode-kernel roofline (synthetic GEMMs, not full generate).",
@@ -597,6 +709,7 @@ def main() -> None:
             f"L2: {l2_bytes / BYTES_PER_MIB:g} MiB  "
             f"L2: {'hot (one weight copy)' if args.hot_l2 else 'cold (rotating copies)'}"
         ),
+        gpu_state_line,
         "Baselines run one after another on this GPU and never overlap.",
         "kernel_us = GPU time per call over back-to-back calls (CUDA graph by default).",
         "eager_us = one call timed alone; includes Python dispatch + launch latency.",
@@ -606,6 +719,10 @@ def main() -> None:
         "fp16 payload = N*K*2 + activations + output.",
         "GB/s = payload_bytes / kernel time.  %peak vs spec DRAM, %copy vs measured copy.",
         "AI = FLOPs / payload_bytes, FLOPs = 2*M*N*K.",
+        (
+            "sm_mhz/temp_c/throttle: nvidia-smi sampled under load after each row. "
+            "Low sm_mhz or sw-power/thermal throttle means that row ran slowed down."
+        ),
     ]
     for line in header:
         print(line)

@@ -29,11 +29,55 @@ T4. The quantizer only exists to produce packed weights in a known format.
 
 Google Colab Tesla T4, `group_size = 128`. Do not copy numbers from other GPUs.
 
+### Operator (`M = 1`)
+
+`scripts/profile_kernel.py`: GPU time per call over 100 back-to-back calls
+replayed from a CUDA graph, with weight copies rotated so every call reads DRAM
+(as in real decode, where each layer has its own weights). `%copy` is GB/s
+against a device-to-device copy measured on the same GPU (about 241 GB/s on a
+Colab T4; spec is 320). Weight MiB is resident FP16 storage, or packed codes +
+scales.
+
+v4 decode kernel (2 rows per warp) and FP16 cuBLAS, same run:
+
+| shape (K, N) | FP16 cuBLAS us | fused us | fused vs FP16 | fused %copy | weight MiB FP16 / packed |
+| --- | --- | --- | --- | --- | --- |
+| attention-like (2048, 2048) | 40.5 | 11.6 | 3.5x faster | 77% | 8.00 / 2.06 |
+| mlp up-like (2048, 5632) | 96.3 | 26.8 | 3.6x faster | 92% | 22.00 / 5.67 |
+| mlp down-like (5632, 2048) | 94.6 | 31.2 | 3.0x faster | 79% | 22.00 / 5.67 |
+
+Packed weights are ~3.9x smaller than FP16, which caps the possible speedup for
+a memory-bound GEMV at about 3.9x. T4 has no INT4 Tensor Cores; the kernel
+unpacks nibbles and does FP32 math.
+
+Decode kernel versions (`W4A16_DECODE`), alternated twice in one session, mean
+of the two runs in us. That session's T4 was clock-throttled, so compare rows
+with each other, not with the table above:
+
+| version | attention | mlp up | mlp down |
+| --- | --- | --- | --- |
+| v3: wide loads + fast unpack, 1 row per warp | 23.3 | 56.7 | 37.3 |
+| v4, 1 row per warp (smaller blocks only) | 23.1 | 53.7 | 42.7 |
+| v4, 2 rows per warp | 16.7 | 35.6 | 36.9 |
+| v4, 4 rows per warp (default) | 17.2 | 31.6 | 34.6 |
+
+Earlier steps, each measured against the previous version in its own session:
+v1 (original, 2-byte loads, two `__syncthreads` per group) took 43.8 / 100.8 /
+93.9 us; v2 (16-byte loads, no barriers, one reduction) took 13.5 / 38.7 /
+41.7 us. v3 removed every `I2F` but barely changed time, which showed the
+remaining limit was per-warp overhead and per-row activation conversion, not
+unpacking; v4 shares those across rows.
+
+T4 lowers its SM clock under its 70 W cap or when hot; memory clock does not
+change, so this compute-heavy kernel slows down more than cuBLAS. The table's
+`sm_mhz`, `temp_c`, and `throttle` columns flag rows that ran slowed down.
+
 ### TinyLlama generate
 
-> **Stale methodology.** The table below is a single cold run with no warmup,
-> and FP16 `2+2` stopped at 9 tokens, so the rows are not comparable. It will be
-> replaced with numbers from the current `scripts/generate.py` (see
+> **Stale.** The table below predates the v2–v4 decode kernels (it used the
+> original v1 kernel), is a single cold run with no warmup, and FP16 `2+2`
+> stopped at 9 tokens, so the rows are not comparable. It will be replaced
+> with numbers from the current `scripts/generate.py` (see
 > [Generate benchmark methodology](#generate-benchmark-methodology)).
 
 `TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
@@ -61,27 +105,6 @@ Prompts: `Write a short haiku about GPUs.` and `What is 2+2?`
 - FP16 haiku (14.50 tok/s) is a cold first generate after `from_pretrained`;
   the next FP16 prompt is 38.76 tok/s. Fused is not faster than warm FP16.
 - Fused and dequant greedy text matched; FP16 wording differed (quantization).
-
-### Operator (`M = 1`)
-
-`scripts/benchmark.py`, warmup 5, iters 20. Weight MiB is resident FP16 storage,
-or packed codes + scales.
-
-| shape (M, K, N) | baseline | median ms | p95 ms | peak MiB | weight MiB |
-| --- | --- | --- | --- | --- | --- |
-| (1, 2048, 2048) attention-like | FP16 | 0.0600 | 0.0654 | 16.14 | 8.00 |
-| (1, 2048, 2048) attention-like | dequant | 0.8120 | 0.8189 | 46.32 | 2.06 |
-| (1, 2048, 2048) attention-like | fused | 0.0676 | 0.0737 | 10.20 | 2.06 |
-| (1, 2048, 5632) mlp up-like | FP16 | 0.1188 | 0.1356 | 30.15 | 22.00 |
-| (1, 2048, 5632) mlp up-like | dequant | 2.1220 | 2.1291 | 113.16 | 5.67 |
-| (1, 2048, 5632) mlp up-like | fused | 0.1509 | 0.1721 | 13.82 | 5.67 |
-| (1, 256, 8) small sanity | FP16 | 0.0320 | 0.0444 | 8.13 | 0.0039 |
-| (1, 256, 8) small sanity | dequant | 0.3030 | 0.3152 | 8.15 | 0.0010 |
-| (1, 256, 8) small sanity | fused | 0.0473 | 0.1441 | 8.13 | 0.0010 |
-
-On the two TinyLlama-like shapes, fused is 12×–14× faster than dequant and
-13%–27% slower than resident FP16 cuBLAS. Packed storage is ~3.9× smaller.
-T4 has no INT4 Tensor Cores; the kernel unpacks nibbles and does FP32 math.
 
 Colab: `notebooks/colab_t4.ipynb`.
 
@@ -194,7 +217,7 @@ scales:         float16  [N, K / group_size]
   from L1 with no `__syncthreads`, and the warp reduces once at the end.
   Nibbles become FP16 through an exponent bit trick (one LOP3 per two weights)
   instead of integer-to-float; multiply-adds stay FP32. Each warp computes
-  several output rows (`W4A16_ROWS_PER_WARP` = 1, 2, or 4; default 2) and shares
+  several output rows (`W4A16_ROWS_PER_WARP` = 1, 2, or 4; default 4) and shares
   each activation load and conversion across them. `W4A16_DECODE` selects the
   version for A/B runs: `v1` original shared-memory kernel, `v2` wide loads,
   `v3` wide loads + fast unpack, `v4` (default) v3 with several rows per warp
