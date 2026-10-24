@@ -5,6 +5,8 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 
 namespace {
@@ -132,6 +134,92 @@ __global__ void int4_linear_kernel_decode(
     if (in_range && lane == 0) {
         output[output_feature] = __float2half_rn(total);
     }
+}
+
+
+// Wide-load decode (M = 1). Same warp-per-output-channel layout as
+// int4_linear_kernel_decode, but:
+// - each lane loads 16 packed bytes (32 weights) with one 128-bit load instead
+//   of 2 bytes, so a warp moves 512 bytes per step instead of 64;
+// - activations are read straight from global memory (L1-cached and shared by
+//   every warp in the block) instead of being staged in shared memory, so there
+//   is no __syncthreads anywhere;
+// - each lane keeps its own scaled total and the warp reduces once at the end
+//   instead of once per group.
+// The 32 weights of a lane's chunk always sit inside one 128-weight group, so
+// one scale covers the whole chunk. Pointers must be 16-byte aligned.
+__global__ void int4_linear_kernel_decode_wide(
+    const __half* __restrict__ activations,
+    const uint8_t* __restrict__ packed_weights,
+    const __half* __restrict__ scales,
+    __half* __restrict__ output,
+    int64_t output_features,
+    int64_t input_features) {
+    const int lane = threadIdx.x & 31;
+    const int64_t output_feature =
+        static_cast<int64_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    // The whole warp shares output_feature, so it exits together and the
+    // full-mask shuffles below stay valid.
+    if (output_feature >= output_features) {
+        return;
+    }
+
+    const int64_t number_of_groups = input_features / 128;
+    const int64_t number_of_chunks = input_features / 32;
+    const uint4* packed_row = reinterpret_cast<const uint4*>(
+        packed_weights + output_feature * (input_features / 2));
+    const uint4* activation_chunks = reinterpret_cast<const uint4*>(activations);
+    const __half* scale_row = scales + output_feature * number_of_groups;
+
+    float total = 0.0F;
+#pragma unroll 4
+    for (int64_t chunk = lane; chunk < number_of_chunks; chunk += 32) {
+        const uint4 packed = packed_row[chunk];
+        const uint32_t packed_words[4] = {packed.x, packed.y, packed.z, packed.w};
+        float chunk_dot = 0.0F;
+
+        // Packed word w holds weights 8w..8w+7 of the chunk; the matching eight
+        // activations are one uint4 (four half2 pairs).
+#pragma unroll
+        for (int word = 0; word < 4; ++word) {
+            const uint4 activation_bits = activation_chunks[chunk * 4 + word];
+            const __half2* activation_pairs =
+                reinterpret_cast<const __half2*>(&activation_bits);
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte) {
+                const uint8_t packed_byte =
+                    static_cast<uint8_t>(packed_words[word] >> (8 * byte));
+                const __half2 activation_pair = activation_pairs[byte];
+                chunk_dot +=
+                    __low2float(activation_pair) *
+                        static_cast<float>(decode_int4(packed_byte)) +
+                    __high2float(activation_pair) *
+                        static_cast<float>(decode_int4(packed_byte >> 4));
+            }
+        }
+
+        total += chunk_dot * __half2float(scale_row[chunk / 4]);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        total += __shfl_down_sync(0xffffffff, total, offset);
+    }
+    if (lane == 0) {
+        output[output_feature] = __float2half_rn(total);
+    }
+}
+
+
+bool is_16_byte_aligned(const void* pointer) {
+    return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
+}
+
+
+// W4A16_DECODE=v1 selects the original shared-memory decode kernel so the two
+// can be compared in the same build.
+bool use_original_decode_kernel() {
+    const char* choice = std::getenv("W4A16_DECODE");
+    return choice != nullptr && std::strcmp(choice, "v1") == 0;
 }
 
 
@@ -304,7 +392,25 @@ at::Tensor int4_linear_cuda(
     constexpr int threads_per_block = 256;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (rows == 1 && group_size == 128) {
+    // The warp kernels use vector loads (half2, uint16, uint4). A tensor that
+    // starts mid-allocation can be contiguous but misaligned; it takes the
+    // naive kernel, which reads one element at a time.
+    const bool warp_kernels = group_size == 128 &&
+        is_16_byte_aligned(activations.data_ptr()) &&
+        is_16_byte_aligned(packed_weights.data_ptr());
+
+    if (rows == 1 && warp_kernels && !use_original_decode_kernel()) {
+        constexpr int warps_per_block = 8;
+        const int blocks = static_cast<int>(
+            (output_features + warps_per_block - 1) / warps_per_block);
+        int4_linear_kernel_decode_wide<<<blocks, threads_per_block, 0, stream>>>(
+            reinterpret_cast<const __half*>(activations.data_ptr<at::Half>()),
+            packed_weights.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+            output_features,
+            input_features);
+    } else if (rows == 1 && warp_kernels) {
         constexpr int warps_per_block = 8;
         const int blocks = static_cast<int>(
             (output_features + warps_per_block - 1) / warps_per_block);
@@ -315,7 +421,7 @@ at::Tensor int4_linear_cuda(
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
             output_features,
             input_features);
-    } else if (rows <= 8 && group_size == 128) {
+    } else if (rows <= 8 && warp_kernels) {
         constexpr int warps_per_block = 8;
         const int blocks = static_cast<int>(
             (output_features + warps_per_block - 1) / warps_per_block);

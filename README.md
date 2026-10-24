@@ -186,12 +186,16 @@ scales:         float16  [N, K / group_size]
 ## Contract
 
 - CUDA `float16` activations, packed `uint8` weights, `float16` scales; all contiguous
-- Fused path: `M <= 8`, `K % 128 == 0`, `group_size = 128` (one warp per output
-  channel; `M = 1` decode kernel, `M = 2..8` small-batch kernel that unpacks
-  each weight once and reuses it for every row)
+- Fused path: `M <= 8`, `K % 128 == 0`, `group_size = 128`, activations and
+  packed weights 16-byte aligned (one warp per output channel; `M = 1` wide-load
+  decode kernel, `M = 2..8` small-batch kernel that unpacks each weight once and
+  reuses it for every row)
+- `M = 1` decode: each lane loads 16 packed bytes per step, reads activations
+  from L1 with no `__syncthreads`, and the warp reduces once at the end.
+  `W4A16_DECODE=v1` selects the original shared-memory decode kernel for A/B runs
 - `QuantizedLinear` with `M > 8` or `fused=False`: dequant + cuBLAS. Calling
-  `linear_cuda` directly with `M > 8` or another group size uses a naive
-  one-thread-per-output kernel
+  `linear_cuda` directly with `M > 8`, another group size, or misaligned
+  tensors uses a naive one-thread-per-output kernel
 - No autograd. Bias, if any, is added in Python after the op
 
 ## API
