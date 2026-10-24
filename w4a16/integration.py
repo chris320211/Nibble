@@ -82,7 +82,9 @@ def _restore_computed_buffers(module: torch.nn.Module) -> None:
         inv_freq_buffer = getattr(child, "inv_freq", None)
         if inv_freq_buffer is None:
             continue
-        inv_freq, attention_scaling = compute(child.config, inv_freq_buffer.device)
+        # Config only: newer transformers dropped the positional device argument.
+        # The result is computed on CPU and moved to the buffer's device below.
+        inv_freq, attention_scaling = compute(child.config)
         inv_freq_buffer.copy_(
             inv_freq.to(device=inv_freq_buffer.device, dtype=inv_freq_buffer.dtype)
         )
