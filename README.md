@@ -193,9 +193,11 @@ scales:         float16  [N, K / group_size]
 - `M = 1` decode: each lane loads 16 packed bytes per step, reads activations
   from L1 with no `__syncthreads`, and the warp reduces once at the end.
   Nibbles become FP16 through an exponent bit trick (one LOP3 per two weights)
-  instead of integer-to-float; multiply-adds stay FP32. `W4A16_DECODE` selects
-  the version for A/B runs: `v1` original shared-memory kernel, `v2` wide
-  loads, `v3` (default) wide loads + fast unpack
+  instead of integer-to-float; multiply-adds stay FP32. Each warp computes
+  several output rows (`W4A16_ROWS_PER_WARP` = 1, 2, or 4; default 2) and shares
+  each activation load and conversion across them. `W4A16_DECODE` selects the
+  version for A/B runs: `v1` original shared-memory kernel, `v2` wide loads,
+  `v3` wide loads + fast unpack, `v4` (default) v3 with several rows per warp
 - `QuantizedLinear` with `M > 8` or `fused=False`: dequant + cuBLAS. Calling
   `linear_cuda` directly with `M > 8`, another group size, or misaligned
   tensors uses a naive one-thread-per-output kernel

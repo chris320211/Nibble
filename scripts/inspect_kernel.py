@@ -80,6 +80,11 @@ def parse_args() -> argparse.Namespace:
         help="Threads per block used by the launches (default: 256).",
     )
     parser.add_argument(
+        "--filter",
+        default="",
+        help="Only show kernels whose short name contains this text (e.g. decode).",
+    )
+    parser.add_argument(
         "--dump-dir",
         type=Path,
         default=Path("profile_results/sass"),
@@ -223,6 +228,8 @@ def main() -> None:
 
     for mangled in sorted(functions, key=lambda name: short_name(names[name], name)):
         kernel = short_name(names[mangled], mangled)
+        if args.filter not in kernel:
+            continue
         counts = opcode_counts(functions[mangled])
         dump_path = args.dump_dir / f"{re.sub(r'[^A-Za-z0-9_]', '_', kernel)}.sass"
         dump_path.write_text("\n".join(functions[mangled]) + "\n")

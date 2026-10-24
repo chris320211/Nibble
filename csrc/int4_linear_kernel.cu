@@ -164,20 +164,19 @@ __device__ __forceinline__ float dot8_decode(
 }
 
 
-// Same result as dot8_decode with about half the instructions. FP16 1024.0 is
-// 0x6400 and its mantissa step is exactly 1, so OR-ing a 4-bit value u into the
-// low mantissa bits gives the half 1024 + u with no conversion instruction.
+// Unpacks 8 weights (one packed word) to exact FP16 with no int-to-float
+// conversion. FP16 1024.0 is 0x6400 and its mantissa step is exactly 1, so
+// OR-ing a 4-bit value u into the low mantissa bits gives the half 1024 + u.
 // One LOP3 per pair of weights does three things at once: masks two nibbles
 // (one per half), flips their sign bit (two's complement w -> offset binary
 // u = w + 8), and sets the 0x6400 exponent. Then:
 // - nibbles in bits 0-3 of a half:  (1024 + u) - 1032          = w
 // - nibbles in bits 4-7 of a half:  (1024 + 16u) / 16 - 72     = w
-// Both are exact in FP16. The multiply-adds stay in FP32, so the result matches
-// the FP32 reference as closely as dot8_decode does.
-// Pairs come out as (w0, w4), (w1, w5), (w2, w6), (w3, w7).
-__device__ __forceinline__ float dot8_fast_unpack(
+// Both are exact in FP16. Pairs come out as weights[0] = (w0, w4),
+// weights[1] = (w1, w5), weights[2] = (w2, w6), weights[3] = (w3, w7).
+__device__ __forceinline__ void unpack8_fast(
     uint32_t packed_word,
-    uint4 activation_bits) {
+    __half2 (&weights)[4]) {
     constexpr uint32_t low_nibbles = 0x000F000F;
     constexpr uint32_t high_nibbles = 0x00F000F0;
     constexpr uint32_t low_magic = 0x64086408;   // 0x6400 | sign flip at bit 3
@@ -187,32 +186,62 @@ __device__ __forceinline__ float dot8_fast_unpack(
     const __half2 minus_72 = bits_to_half2(0xD480D480);
 
     const uint32_t shifted_word = packed_word >> 8;
-    const __half2 weights_04 = __hsub2(
+    weights[0] = __hsub2(
         bits_to_half2((packed_word & low_nibbles) ^ low_magic), offset_1032);
-    const __half2 weights_15 = __hfma2(
+    weights[1] = __hfma2(
         bits_to_half2((packed_word & high_nibbles) ^ high_magic),
         one_sixteenth,
         minus_72);
-    const __half2 weights_26 = __hsub2(
+    weights[2] = __hsub2(
         bits_to_half2((shifted_word & low_nibbles) ^ low_magic), offset_1032);
-    const __half2 weights_37 = __hfma2(
+    weights[3] = __hfma2(
         bits_to_half2((shifted_word & high_nibbles) ^ high_magic),
         one_sixteenth,
         minus_72);
+}
 
-    const __half2 activations_01 = bits_to_half2(activation_bits.x);
-    const __half2 activations_23 = bits_to_half2(activation_bits.y);
-    const __half2 activations_45 = bits_to_half2(activation_bits.z);
-    const __half2 activations_67 = bits_to_half2(activation_bits.w);
 
-    return __low2float(activations_01) * __low2float(weights_04) +
-           __high2float(activations_01) * __low2float(weights_15) +
-           __low2float(activations_23) * __low2float(weights_26) +
-           __high2float(activations_23) * __low2float(weights_37) +
-           __low2float(activations_45) * __high2float(weights_04) +
-           __high2float(activations_45) * __high2float(weights_15) +
-           __low2float(activations_67) * __high2float(weights_26) +
-           __high2float(activations_67) * __high2float(weights_37);
+// Eight activations (one uint4 = four half2 pairs) as FP32, in order x0..x7.
+__device__ __forceinline__ void activations8_to_float(
+    uint4 activation_bits,
+    float (&activations)[8]) {
+    const uint32_t words[4] = {
+        activation_bits.x, activation_bits.y, activation_bits.z, activation_bits.w};
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        activations[2 * pair] = __low2float(bits_to_half2(words[pair]));
+        activations[2 * pair + 1] = __high2float(bits_to_half2(words[pair]));
+    }
+}
+
+
+// FP32 dot product of 8 unpacked weights (pair order from unpack8_fast) with
+// 8 FP32 activations.
+__device__ __forceinline__ float dot8_unpacked(
+    const __half2 (&weights)[4],
+    const float (&activations)[8]) {
+    return activations[0] * __low2float(weights[0]) +
+           activations[1] * __low2float(weights[1]) +
+           activations[2] * __low2float(weights[2]) +
+           activations[3] * __low2float(weights[3]) +
+           activations[4] * __high2float(weights[0]) +
+           activations[5] * __high2float(weights[1]) +
+           activations[6] * __high2float(weights[2]) +
+           activations[7] * __high2float(weights[3]);
+}
+
+
+// Same result as dot8_decode with about half the instructions: unpack8_fast
+// replaces decode_int4 + int-to-float. The multiply-adds stay in FP32, so the
+// result matches the FP32 reference as closely as dot8_decode does.
+__device__ __forceinline__ float dot8_fast_unpack(
+    uint32_t packed_word,
+    uint4 activation_bits) {
+    __half2 weights[4];
+    float activations[8];
+    unpack8_fast(packed_word, weights);
+    activations8_to_float(activation_bits, activations);
+    return dot8_unpacked(weights, activations);
 }
 
 
@@ -283,15 +312,107 @@ __global__ void int4_linear_kernel_decode_wide(
 }
 
 
+// Multi-row decode (M = 1). Same 32-weight lane chunks, fast unpack, and single
+// final reduction as int4_linear_kernel_decode_wide<true>, but each warp owns
+// ROWS_PER_WARP consecutive output channels and blocks hold 4 warps:
+// - each activation word is loaded and converted to FP32 once per warp and
+//   reused for every row (v3 converts it once per row);
+// - each lane has ROWS_PER_WARP weight loads in flight per chunk;
+// - each warp does ROWS_PER_WARP times more work per launch and reduction, and
+//   smaller blocks spread more evenly over the SMs.
+// In the last warp, rows past output_features recompute the last valid row and
+// are not stored, so every warp runs the same loop.
+template <int ROWS_PER_WARP>
+__global__ void int4_linear_kernel_decode_multirow(
+    const __half* __restrict__ activations,
+    const uint8_t* __restrict__ packed_weights,
+    const __half* __restrict__ scales,
+    __half* __restrict__ output,
+    int64_t output_features,
+    int64_t input_features) {
+    const int lane = threadIdx.x & 31;
+    const int64_t warp_index =
+        static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + (threadIdx.x >> 5);
+    const int64_t first_row = warp_index * ROWS_PER_WARP;
+    // The whole warp shares first_row, so it exits together and the full-mask
+    // shuffles below stay valid.
+    if (first_row >= output_features) {
+        return;
+    }
+
+    const int64_t number_of_groups = input_features / 128;
+    const int64_t number_of_chunks = input_features / 32;
+    const uint4* activation_chunks = reinterpret_cast<const uint4*>(activations);
+    const uint4* packed_rows[ROWS_PER_WARP];
+    const __half* scale_rows[ROWS_PER_WARP];
+    float totals[ROWS_PER_WARP];
+#pragma unroll
+    for (int row = 0; row < ROWS_PER_WARP; ++row) {
+        const int64_t output_feature = first_row + row < output_features
+            ? first_row + row
+            : output_features - 1;
+        packed_rows[row] = reinterpret_cast<const uint4*>(
+            packed_weights + output_feature * (input_features / 2));
+        scale_rows[row] = scales + output_feature * number_of_groups;
+        totals[row] = 0.0F;
+    }
+
+    // Keep about 4 chunks of weight loads in flight per lane, as v3 does.
+#pragma unroll (ROWS_PER_WARP >= 4 ? 1 : 4 / ROWS_PER_WARP)
+    for (int64_t chunk = lane; chunk < number_of_chunks; chunk += 32) {
+        uint32_t packed_words[ROWS_PER_WARP][4];
+        float chunk_dots[ROWS_PER_WARP];
+#pragma unroll
+        for (int row = 0; row < ROWS_PER_WARP; ++row) {
+            const uint4 packed = packed_rows[row][chunk];
+            packed_words[row][0] = packed.x;
+            packed_words[row][1] = packed.y;
+            packed_words[row][2] = packed.z;
+            packed_words[row][3] = packed.w;
+            chunk_dots[row] = 0.0F;
+        }
+
+#pragma unroll
+        for (int word = 0; word < 4; ++word) {
+            float activation_values[8];
+            activations8_to_float(
+                activation_chunks[chunk * 4 + word], activation_values);
+#pragma unroll
+            for (int row = 0; row < ROWS_PER_WARP; ++row) {
+                __half2 weights[4];
+                unpack8_fast(packed_words[row][word], weights);
+                chunk_dots[row] += dot8_unpacked(weights, activation_values);
+            }
+        }
+
+#pragma unroll
+        for (int row = 0; row < ROWS_PER_WARP; ++row) {
+            totals[row] += chunk_dots[row] * __half2float(scale_rows[row][chunk / 4]);
+        }
+    }
+
+#pragma unroll
+    for (int row = 0; row < ROWS_PER_WARP; ++row) {
+        float total = totals[row];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffff, total, offset);
+        }
+        if (lane == 0 && first_row + row < output_features) {
+            output[first_row + row] = __float2half_rn(total);
+        }
+    }
+}
+
+
 bool is_16_byte_aligned(const void* pointer) {
     return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
 }
 
 
 // M = 1 decode kernel versions, compared in the same build with W4A16_DECODE:
-// v1 = original shared-memory kernel, v2 = wide loads, v3 (default) = wide
-// loads + fast unpack.
-enum class DecodeVersion { original, wide, fast_unpack };
+// v1 = original shared-memory kernel, v2 = wide loads, v3 = wide loads + fast
+// unpack, v4 (default) = v3 with several rows per warp.
+enum class DecodeVersion { original, wide, fast_unpack, multirow };
 
 DecodeVersion selected_decode_version() {
     const char* choice = std::getenv("W4A16_DECODE");
@@ -301,7 +422,47 @@ DecodeVersion selected_decode_version() {
     if (choice != nullptr && std::strcmp(choice, "v2") == 0) {
         return DecodeVersion::wide;
     }
-    return DecodeVersion::fast_unpack;
+    if (choice != nullptr && std::strcmp(choice, "v3") == 0) {
+        return DecodeVersion::fast_unpack;
+    }
+    return DecodeVersion::multirow;
+}
+
+
+// Output rows per warp for v4, from W4A16_ROWS_PER_WARP (default 2).
+int selected_rows_per_warp() {
+    const char* choice = std::getenv("W4A16_ROWS_PER_WARP");
+    if (choice == nullptr) {
+        return 2;
+    }
+    const int rows = std::atoi(choice);
+    TORCH_CHECK(
+        rows == 1 || rows == 2 || rows == 4,
+        "W4A16_ROWS_PER_WARP must be 1, 2, or 4");
+    return rows;
+}
+
+
+template <int ROWS_PER_WARP>
+void launch_decode_multirow(
+    const at::Tensor& activations,
+    const at::Tensor& packed_weights,
+    const at::Tensor& scales,
+    at::Tensor& output,
+    cudaStream_t stream) {
+    constexpr int warps_per_block = 4;
+    constexpr int rows_per_block = warps_per_block * ROWS_PER_WARP;
+    const int64_t output_features = packed_weights.size(0);
+    const int blocks = static_cast<int>(
+        (output_features + rows_per_block - 1) / rows_per_block);
+    int4_linear_kernel_decode_multirow<ROWS_PER_WARP>
+        <<<blocks, warps_per_block * 32, 0, stream>>>(
+            reinterpret_cast<const __half*>(activations.data_ptr<at::Half>()),
+            packed_weights.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+            output_features,
+            activations.size(1));
 }
 
 
@@ -522,6 +683,22 @@ at::Tensor int4_linear_cuda(
             case DecodeVersion::fast_unpack:
                 launch_decode_wide<true>(activations, packed_weights, scales, output,
                                          blocks, threads_per_block, stream);
+                break;
+            case DecodeVersion::multirow:
+                switch (selected_rows_per_warp()) {
+                    case 1:
+                        launch_decode_multirow<1>(
+                            activations, packed_weights, scales, output, stream);
+                        break;
+                    case 2:
+                        launch_decode_multirow<2>(
+                            activations, packed_weights, scales, output, stream);
+                        break;
+                    default:
+                        launch_decode_multirow<4>(
+                            activations, packed_weights, scales, output, stream);
+                        break;
+                }
                 break;
         }
     } else if (rows <= 8 && warp_kernels) {

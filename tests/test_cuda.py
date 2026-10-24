@@ -201,7 +201,7 @@ def test_cuda_linear_decode_misaligned_activations_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
+@pytest.mark.parametrize("version", ["v1", "v2", "v3", "v4"])
 def test_cuda_linear_decode_versions_match_reference(
     version: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -228,7 +228,7 @@ def test_cuda_linear_decode_versions_match_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
+@pytest.mark.parametrize("version", ["v1", "v2", "v3", "v4"])
 def test_cuda_linear_decode_all_nibble_values_match_reference(
     version: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -257,6 +257,59 @@ def test_cuda_linear_decode_all_nibble_values_match_reference(
     result = linear_cuda(activations, packed_weights, scales, group_size=128)
 
     torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("rows_per_warp", ["1", "2", "4"])
+@pytest.mark.parametrize(
+    ("k", "n"),
+    [(256, 7), (1024, 13), (2048, 2048), (5632, 2048), (2048, 5632)],
+)
+def test_cuda_linear_decode_multirow_matches_reference(
+    rows_per_warp: str,
+    k: int,
+    n: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    # n = 7 and 13 leave a partial last warp (rows past N are not stored).
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((1, k), dtype=torch.float16, device=device)
+    weights = torch.randn((n, k), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    monkeypatch.setenv("W4A16_DECODE", "v4")
+    monkeypatch.setenv("W4A16_ROWS_PER_WARP", rows_per_warp)
+    result = linear_cuda(activations, packed_weights, scales, group_size=128)
+
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_linear_cuda_rejects_bad_rows_per_warp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    device = torch.device("cuda")
+    activations = torch.randn((1, 256), dtype=torch.float16, device=device)
+    weights = torch.randn((8, 256), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+
+    monkeypatch.setenv("W4A16_DECODE", "v4")
+    monkeypatch.setenv("W4A16_ROWS_PER_WARP", "3")
+    with pytest.raises(RuntimeError):
+        linear_cuda(activations, packed_weights, scales, group_size=128)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
