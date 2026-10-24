@@ -134,6 +134,108 @@ __global__ void int4_linear_kernel_decode(
     }
 }
 
+
+// Small-batch decode (M = ROWS, 2..8). Same warp-per-output-channel layout as
+// int4_linear_kernel_decode, but each warp unpacks its 4 weights once and
+// reuses them for every activation row. Each lane applies the group scale to
+// its own partial sums, so the warp reduces once per row at the end instead of
+// once per group.
+template <int ROWS>
+__global__ void int4_linear_kernel_small_batch(
+    const __half* activations,
+    const uint8_t* packed_weights,
+    const __half* scales,
+    __half* output,
+    int64_t output_features,
+    int64_t input_features) {
+    const int lane = threadIdx.x & 31;
+    const int64_t output_feature =
+        static_cast<int64_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    const int64_t packed_input_features = input_features / 2;
+    const int64_t number_of_groups = input_features / 128;
+    const bool in_range = output_feature < output_features;
+    const uint8_t* packed_row =
+        packed_weights + output_feature * packed_input_features;
+    const __half* scale_row = scales + output_feature * number_of_groups;
+
+    __shared__ __half2 shared_activations[ROWS][64];
+    float totals[ROWS];
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+        totals[row] = 0.0F;
+    }
+
+    for (int64_t group = 0; group < number_of_groups; ++group) {
+        for (int index = threadIdx.x; index < ROWS * 64; index += blockDim.x) {
+            const int row = index / 64;
+            const int column = index % 64;
+            const __half2* activation_group = reinterpret_cast<const __half2*>(
+                activations + row * input_features + group * 128);
+            shared_activations[row][column] = activation_group[column];
+        }
+        __syncthreads();
+
+        if (in_range) {
+            const uint16_t packed_pair = reinterpret_cast<const uint16_t*>(
+                packed_row + group * 64)[lane];
+            const uint8_t packed_0 = static_cast<uint8_t>(packed_pair);
+            const uint8_t packed_1 = static_cast<uint8_t>(packed_pair >> 8);
+            const float scale = __half2float(scale_row[group]);
+            const float weight_0 = static_cast<float>(decode_int4(packed_0));
+            const float weight_1 = static_cast<float>(decode_int4(packed_0 >> 4));
+            const float weight_2 = static_cast<float>(decode_int4(packed_1));
+            const float weight_3 = static_cast<float>(decode_int4(packed_1 >> 4));
+
+#pragma unroll
+            for (int row = 0; row < ROWS; ++row) {
+                const __half2 activation_01 = shared_activations[row][lane * 2];
+                const __half2 activation_23 = shared_activations[row][lane * 2 + 1];
+                const float group_dot =
+                    __low2float(activation_01) * weight_0 +
+                    __high2float(activation_01) * weight_1 +
+                    __low2float(activation_23) * weight_2 +
+                    __high2float(activation_23) * weight_3;
+                totals[row] += group_dot * scale;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (in_range) {
+#pragma unroll
+        for (int row = 0; row < ROWS; ++row) {
+            float total = totals[row];
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(0xffffffff, total, offset);
+            }
+            if (lane == 0) {
+                output[row * output_features + output_feature] =
+                    __float2half_rn(total);
+            }
+        }
+    }
+}
+
+
+template <int ROWS>
+void launch_small_batch(
+    const at::Tensor& activations,
+    const at::Tensor& packed_weights,
+    const at::Tensor& scales,
+    at::Tensor& output,
+    int blocks,
+    int threads_per_block,
+    cudaStream_t stream) {
+    int4_linear_kernel_small_batch<ROWS><<<blocks, threads_per_block, 0, stream>>>(
+        reinterpret_cast<const __half*>(activations.data_ptr<at::Half>()),
+        packed_weights.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+        packed_weights.size(0),
+        activations.size(1));
+}
+
 }  // namespace
 
 
@@ -213,6 +315,40 @@ at::Tensor int4_linear_cuda(
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
             output_features,
             input_features);
+    } else if (rows <= 8 && group_size == 128) {
+        constexpr int warps_per_block = 8;
+        const int blocks = static_cast<int>(
+            (output_features + warps_per_block - 1) / warps_per_block);
+        switch (rows) {
+            case 2:
+                launch_small_batch<2>(activations, packed_weights, scales, output,
+                                      blocks, threads_per_block, stream);
+                break;
+            case 3:
+                launch_small_batch<3>(activations, packed_weights, scales, output,
+                                      blocks, threads_per_block, stream);
+                break;
+            case 4:
+                launch_small_batch<4>(activations, packed_weights, scales, output,
+                                      blocks, threads_per_block, stream);
+                break;
+            case 5:
+                launch_small_batch<5>(activations, packed_weights, scales, output,
+                                      blocks, threads_per_block, stream);
+                break;
+            case 6:
+                launch_small_batch<6>(activations, packed_weights, scales, output,
+                                      blocks, threads_per_block, stream);
+                break;
+            case 7:
+                launch_small_batch<7>(activations, packed_weights, scales, output,
+                                      blocks, threads_per_block, stream);
+                break;
+            default:
+                launch_small_batch<8>(activations, packed_weights, scales, output,
+                                      blocks, threads_per_block, stream);
+                break;
+        }
     } else {
         const int blocks = static_cast<int>(
             (number_of_outputs + threads_per_block - 1) / threads_per_block);

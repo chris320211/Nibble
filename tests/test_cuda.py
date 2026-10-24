@@ -219,3 +219,88 @@ def test_linear_cuda_rejects_mismatched_k() -> None:
             scales,
             group_size=128,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
+def test_cuda_linear_small_batch_matches_reference(rows: int) -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((rows, 2048), dtype=torch.float16, device=device)
+    weights = torch.randn((2048, 2048), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    result = linear_cuda(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("rows", [2, 8])
+def test_cuda_linear_small_batch_n_not_divisible_by_8_matches_reference(
+    rows: int,
+) -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((rows, 256), dtype=torch.float16, device=device)
+    weights = torch.randn((7, 256), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    result = linear_cuda(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_linear_above_small_batch_uses_naive_and_matches_reference() -> None:
+    if not cuda_extension_available():
+        pytest.skip("W4A16 CUDA extension is not built")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    activations = torch.randn((9, 256), dtype=torch.float16, device=device)
+    weights = torch.randn((8, 256), dtype=torch.float16, device=device)
+    packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
+
+    expected = linear_reference(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+    result = linear_cuda(
+        activations,
+        packed_weights,
+        scales,
+        group_size=128,
+    )
+
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)

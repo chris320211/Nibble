@@ -208,7 +208,8 @@ def test_quantized_linear_cuda_decode_matches_reference() -> None:
 def test_quantized_linear_cuda_prefill_matches_dequant_linear() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
-    activations = torch.randn((4, 128), dtype=torch.float16, device=device)
+    # M > FUSED_MAX_ROWS, so the module takes the dequant + cuBLAS path.
+    activations = torch.randn((16, 128), dtype=torch.float16, device=device)
     weights = torch.randn((8, 128), dtype=torch.float16, device=device)
     packed_weights, scales = quantize_and_pack_weights(weights, group_size=128)
     layer = QuantizedLinear(packed_weights, scales, group_size=128, fused=True)

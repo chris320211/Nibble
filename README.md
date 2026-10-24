@@ -7,16 +7,34 @@ FP16 activations [M, K]  x  packed INT4 weights [N, K]  ->  FP16 output [M, N]
 ```
 
 Unpack, dequant, and multiply in one kernel. No full FP16 weight matrix in
-global memory. Inference only. Primary shape: single-token decode (`M = 1`).
+global memory. Inference only. Primary shape: single-token decode (`M = 1`),
+with a small-batch kernel for `M = 2..8`.
 
 Kernel correctness is match vs Python `linear_reference` on the same packed
 codes. Difference vs FP16 `nn.Linear` is quantization error, not kernel error.
+
+## Scope: a kernel project, not a quantization method
+
+The quantization here is deliberately simple and **lossy**: plain
+round-to-nearest, symmetric, per-group absmax scaling down to 4 bits. It is not
+a novel method and not production quality: no calibration data, no outlier
+handling, no error compensation (GPTQ, AWQ, and similar do all of that). Model
+quality is expected to drop and is not measured here.
+
+The point of the project is the **kernel**: given weights already packed to
+INT4, run the linear layer as fast and with as little memory as possible on a
+T4. The quantizer only exists to produce packed weights in a known format.
 
 ## Results (Colab T4)
 
 Google Colab Tesla T4, `group_size = 128`. Do not copy numbers from other GPUs.
 
 ### TinyLlama generate
+
+> **Stale methodology.** The table below is a single cold run with no warmup,
+> and FP16 `2+2` stopped at 9 tokens, so the rows are not comparable. It will be
+> replaced with numbers from the current `scripts/generate.py` (see
+> [Generate benchmark methodology](#generate-benchmark-methodology)).
 
 `TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, `max_new_tokens = 32`, chat
 template. Fused: `M = 1` kernel, `M > 1` dequant+cuBLAS. FP16 loads Hugging Face
@@ -70,7 +88,8 @@ Colab: `notebooks/colab_t4.ipynb`.
 ## Install
 
 PyTorch with CUDA and `nvcc`. `setup.py` targets `sm_75`. TinyLlama scripts
-need `transformers`.
+need `transformers`. The bitsandbytes comparison needs `bitsandbytes`
+(optional; skipped if missing).
 
 ```bash
 python setup.py build_ext --inplace
@@ -84,12 +103,74 @@ python scripts/quantize_tinyllama.py
 python scripts/generate.py --mode fp16
 python scripts/generate.py --mode dequant --checkpoint checkpoints/tinyllama-w4a16.pt
 python scripts/generate.py --mode fused --checkpoint checkpoints/tinyllama-w4a16.pt
+python scripts/generate.py --mode bnb-nf4
 python scripts/generate.py --mode all --checkpoint checkpoints/tinyllama-w4a16.pt
-python scripts/benchmark.py
+python scripts/benchmark.py --m 1 2 4 8
+python scripts/profile_kernel.py --baselines fused resident_fp16
 ```
 
-`--mode all` runs FP16, dequant, then fused sequentially. Operator `tok/s` in
-`benchmark.py` is `1000 / median_ms` for one `M = 1` linear, not full generate.
+`--mode all` runs FP16, bnb-nf4 (if installed), dequant, then fused
+sequentially. Operator `tok/s` in `benchmark.py` is `1000 * M / median_ms` for
+one linear, not full generate.
+
+### Generate benchmark methodology
+
+Per mode and prompt, `scripts/generate.py`:
+
+1. Runs one untimed generate that stops at EOS and prints its text. This also
+   warms up the CUDA context, cuBLAS, and the caching allocator.
+2. Runs `--warmup` more untimed generates (default 1).
+3. Times `--runs` generates (default 5) of prefill only (`max_new_tokens = 1`)
+   and `--runs` generates forced to exactly `--max-new-tokens` tokens
+   (`min_new_tokens` ignores EOS), so every mode decodes the same length.
+
+It reports medians: `prefill_ms`, `decode_ms = total_ms - prefill_ms`,
+`decode tok/s = (new_tokens - 1) / decode_s` (the number the `M = 1` kernel
+affects), and `e2e tok/s` (includes prefill).
+
+### Comparison with bitsandbytes NF4
+
+`bnb_nf4` (operator) and `--mode bnb-nf4` (generate) use bitsandbytes NF4, the
+4-bit path behind Hugging Face `load_in_4bit`. Formats differ, so this compares
+kernels, not quantization quality:
+
+| | this repo | bitsandbytes NF4 |
+| --- | --- | --- |
+| codes | INT4 `[-7, 7]`, round-to-nearest | NF4 lookup table |
+| scales | FP16 per 128 weights (~4.1 bits/weight) | FP32 absmax per 64 (~4.5 bits/weight) |
+| `lm_head` | quantized | FP16 (transformers default) |
+
+## Profile
+
+Neither script needs Nsight, so both run on Colab, where `ncu` fails with
+`ERR_NVGPUCTRPERM`. Rebuild after `setup.py` so NVCC `-lineinfo` is present for
+source-mapped ncu later.
+
+- `profile_kernel.py` reports `kernel_us`, GPU time per call over 100
+  back-to-back calls replayed from a CUDA graph. Weight copies are rotated so
+  every call reads DRAM, not L2 (T4 L2 is 4 MiB, larger than packed attention
+  weights). `eager_us` is a single call timed alone, which adds Python dispatch
+  and launch latency (about 30 us on Colab). `%peak` is against spec DRAM
+  (looked up from the GPU name) and `%copy` against a measured device copy.
+- `inspect_kernel.py` reads the built `.so` with `cuobjdump`: registers, spills,
+  occupancy, global load widths, barriers, shuffles, and convert/FMA counts per
+  kernel. SASS is written to `profile_results/sass/`.
+
+```bash
+python scripts/profile_kernel.py --baselines fused resident_fp16
+python scripts/inspect_kernel.py
+# later, when ncu works:
+ncu --target-processes all \
+    --profile-from-start off \
+    --kernel-name regex:int4_linear_kernel_decode \
+    --launch-count 3 \
+    --section SpeedOfLight --section MemoryWorkloadAnalysis \
+    --section WarpStateStats --section Occupancy \
+    -o profile_results/ncu_decode \
+    python scripts/profile_kernel.py --baselines fused --warmup 10 --iters 5 --cuda-profiler
+nsys profile -o profile_results/nsys_decode --trace=cuda,nvtx --capture-range=cudaProfilerApi \
+    python scripts/profile_kernel.py --baselines fused --cuda-profiler
+```
 
 ## Format
 
@@ -105,8 +186,12 @@ scales:         float16  [N, K / group_size]
 ## Contract
 
 - CUDA `float16` activations, packed `uint8` weights, `float16` scales; all contiguous
-- Fused path: `M = 1`, `K % 128 == 0`, `group_size = 128` (one warp per output channel)
-- `M > 1` or `fused=False`: dequant + cuBLAS
+- Fused path: `M <= 8`, `K % 128 == 0`, `group_size = 128` (one warp per output
+  channel; `M = 1` decode kernel, `M = 2..8` small-batch kernel that unpacks
+  each weight once and reuses it for every row)
+- `QuantizedLinear` with `M > 8` or `fused=False`: dequant + cuBLAS. Calling
+  `linear_cuda` directly with `M > 8` or another group size uses a naive
+  one-thread-per-output kernel
 - No autograd. Bias, if any, is added in Python after the op
 
 ## API

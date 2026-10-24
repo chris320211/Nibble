@@ -15,7 +15,12 @@ setup(
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-O3", "-gencode", "arch=compute_75,code=sm_75"],
+                "nvcc": [
+                    "-O3",
+                    "-lineinfo",
+                    "-gencode",
+                    "arch=compute_75,code=sm_75",
+                ],
             },
         )
     ],

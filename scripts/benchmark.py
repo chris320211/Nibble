@@ -1,11 +1,12 @@
 """Operator-level W4A16 linear benchmark (synthetic GEMMs, not generate).
 
-Published numbers should be collected on an on-demand g4dn.xlarge
-(NVIDIA T4, compute capability sm_75). This script does not embed timing
-results; run it on that instance to collect numbers.
+Published numbers should be collected on an NVIDIA T4 (sm_75). This script
+does not embed timing results; run it on a T4 to collect numbers.
 
 Baselines run one after another on the same GPU and never overlap:
-resident_fp16, then dequant_every_call, then fused.
+resident_fp16, dequant_every_call, bnb_nf4, then fused. bnb_nf4 is the
+bitsandbytes NF4 4-bit path that Hugging Face uses for load_in_4bit
+(blocksize 64, FP32 absmax); it is skipped if bitsandbytes is not installed.
 """
 
 import argparse
@@ -36,7 +37,16 @@ SHAPES: list[tuple[str, int, int]] = [
     ("small sanity", 256, 8),
 ]
 
-BASELINE_ORDER = ("resident_fp16", "dequant_every_call", "fused")
+BASELINE_ORDER = ("resident_fp16", "dequant_every_call", "bnb_nf4", "fused")
+BNB_BLOCKSIZE = 64
+
+
+def import_bitsandbytes():
+    try:
+        import bitsandbytes
+    except ImportError:
+        return None
+    return bitsandbytes
 
 
 @dataclass(frozen=True)
@@ -51,7 +61,7 @@ class Row:
     tokens_per_s: float | None
     peak_mib: float
     fp16_bytes: int
-    packed_bytes: int
+    weight_bytes: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,8 +74,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--m",
         type=int,
-        default=1,
-        help="Activation rows M for every shape (default: 1, decode).",
+        nargs="+",
+        default=[1],
+        help=(
+            "Activation rows M to sweep for every shape (default: 1, decode). "
+            "The fused path uses dedicated kernels for M <= 8."
+        ),
     )
     parser.add_argument(
         "--warmup",
@@ -97,12 +111,6 @@ def parse_args() -> argparse.Namespace:
 
 def fp16_weight_bytes(n: int, k: int) -> int:
     return n * k * 2
-
-
-def packed_weight_bytes(n: int, k: int, group_size: int) -> int:
-    packed_numel = n * (k // 2)
-    scales_numel = n * (k // group_size)
-    return packed_numel + scales_numel * 2
 
 
 def median_ms(samples_ms: list[float]) -> float:
@@ -151,36 +159,56 @@ def measure(
 def make_operation(
     baseline: str,
     x: torch.Tensor,
-    weight_fp16: torch.Tensor | None,
-    packed: torch.Tensor | None,
-    scales: torch.Tensor | None,
+    source_weight: torch.Tensor,
     group_size: int,
-) -> Callable[[], torch.Tensor]:
+) -> tuple[Callable[[], torch.Tensor], int]:
+    """Build the timed operation and return it with its stored weight bytes."""
     if baseline == "resident_fp16":
-        assert weight_fp16 is not None
+        weight_fp16 = source_weight
 
         def resident_fp16() -> torch.Tensor:
             return F.linear(x, weight_fp16)
 
-        return resident_fp16
+        return resident_fp16, weight_fp16.numel() * weight_fp16.element_size()
+
+    if baseline == "bnb_nf4":
+        bnb = import_bitsandbytes()
+        assert bnb is not None
+        qweight, quant_state = bnb.functional.quantize_4bit(
+            source_weight,
+            blocksize=BNB_BLOCKSIZE,
+            quant_type="nf4",
+        )
+        stored_bytes = (
+            qweight.numel() * qweight.element_size()
+            + quant_state.absmax.numel() * quant_state.absmax.element_size()
+        )
+
+        def bnb_nf4() -> torch.Tensor:
+            return bnb.matmul_4bit(x, qweight.t(), quant_state=quant_state)
+
+        return bnb_nf4, stored_bytes
+
+    packed, scales = quantize_and_pack_weights(source_weight, group_size)
+    packed = packed.contiguous()
+    scales = scales.contiguous()
+    stored_bytes = packed.numel() + scales.numel() * 2
 
     if baseline == "dequant_every_call":
-        assert packed is not None and scales is not None
 
         def dequant_every_call() -> torch.Tensor:
             # dequantize_weights returns float32; cast to FP16 to match W4A16.
             reconstructed = dequantize_weights(packed, scales, group_size)
             return F.linear(x, reconstructed.to(torch.float16))
 
-        return dequant_every_call
+        return dequant_every_call, stored_bytes
 
     if baseline == "fused":
-        assert packed is not None and scales is not None
 
         def fused() -> torch.Tensor:
             return w4a16.linear_cuda(x, packed, scales, group_size=group_size)
 
-        return fused
+        return fused, stored_bytes
 
     raise ValueError(f"unknown baseline: {baseline}")
 
@@ -196,42 +224,19 @@ def run_one(
     device: torch.device,
 ) -> Row:
     x = torch.randn((m, k), dtype=torch.float16, device=device)
-
-    weight_fp16: torch.Tensor | None = None
-    packed: torch.Tensor | None = None
-    scales: torch.Tensor | None = None
-
-    if baseline == "resident_fp16":
-        weight_fp16 = torch.randn((n, k), dtype=torch.float16, device=device)
-    else:
-        source_weight = torch.randn((n, k), dtype=torch.float16, device=device)
-        packed, scales = quantize_and_pack_weights(source_weight, GROUP_SIZE)
-        packed = packed.contiguous()
-        scales = scales.contiguous()
+    source_weight = torch.randn((n, k), dtype=torch.float16, device=device)
+    operation, stored_bytes = make_operation(baseline, x, source_weight, GROUP_SIZE)
+    if baseline != "resident_fp16":
+        # Quantized baselines must not keep the FP16 source resident.
         del source_weight
+        source_weight = None
+        torch.cuda.empty_cache()
 
-    operation = make_operation(
-        baseline,
-        x,
-        weight_fp16,
-        packed,
-        scales,
-        GROUP_SIZE,
-    )
     samples_ms, peak_bytes = measure(operation, warmup, iters)
     med = median_ms(samples_ms)
-    tokens: float | None
-    if m == 1 and med > 0.0:
-        tokens = 1000.0 / med
-    else:
-        tokens = None
+    tokens = 1000.0 * m / med if med > 0.0 else None
 
-    if packed is not None and scales is not None:
-        stored_packed_bytes = packed.numel() + scales.numel() * 2
-    else:
-        stored_packed_bytes = packed_weight_bytes(n, k, GROUP_SIZE)
-
-    del operation, x, weight_fp16, packed, scales
+    del operation, x, source_weight
     torch.cuda.synchronize()
 
     return Row(
@@ -245,7 +250,7 @@ def run_one(
         tokens_per_s=tokens,
         peak_mib=peak_bytes / BYTES_PER_MIB,
         fp16_bytes=fp16_weight_bytes(n, k),
-        packed_bytes=stored_packed_bytes,
+        weight_bytes=stored_bytes,
     )
 
 
@@ -267,7 +272,7 @@ def format_table(rows: list[Row]) -> str:
         "tok/s",
         "peak_MiB",
         "fp16_bytes",
-        "packed_bytes",
+        "weight_bytes",
     )
     table_rows = [
         (
@@ -281,7 +286,7 @@ def format_table(rows: list[Row]) -> str:
             format_tokens(row.tokens_per_s),
             f"{row.peak_mib:.2f}",
             str(row.fp16_bytes),
-            str(row.packed_bytes),
+            str(row.weight_bytes),
         )
         for row in rows
     ]
@@ -302,7 +307,7 @@ def format_table(rows: list[Row]) -> str:
 
 def main() -> None:
     args = parse_args()
-    if args.m < 1:
+    if any(m < 1 for m in args.m):
         sys.exit("--m must be >= 1")
     if args.warmup < 0:
         sys.exit("--warmup must be >= 0")
@@ -325,6 +330,12 @@ def main() -> None:
         lines.append(skip)
         requested = [name for name in requested if name != "fused"]
 
+    if "bnb_nf4" in requested and import_bitsandbytes() is None:
+        skip = "Skipping bnb_nf4: `pip install bitsandbytes` to compare against it."
+        print(skip)
+        lines.append(skip)
+        requested = [name for name in requested if name != "bnb_nf4"]
+
     if not requested:
         sys.exit("No baselines left to run.")
 
@@ -333,12 +344,17 @@ def main() -> None:
 
     header = [
         "W4A16 operator-level linear benchmark (synthetic GEMMs, not full generate).",
-        "Collect published numbers on an on-demand g4dn.xlarge (T4, sm_75).",
+        "Collect published numbers on an NVIDIA T4 (sm_75).",
         f"GPU: {torch.cuda.get_device_name(0)}",
-        f"M={args.m}  warmup={args.warmup}  iters={args.iters}  group_size={GROUP_SIZE}",
+        (
+            f"M={','.join(str(m) for m in args.m)}  warmup={args.warmup}  "
+            f"iters={args.iters}  group_size={GROUP_SIZE}"
+        ),
         "Baselines run one after another on this GPU and never overlap.",
-        "tok/s = 1000 / median_ms for M=1 only; operator-level, not full generate.",
-        "Weight storage: fp16_bytes = N*K*2; packed_bytes = packed.numel() + scales.numel()*2.",
+        "tok/s = 1000 * M / median_ms; operator-level, not full generate.",
+        "fp16_bytes = N*K*2. weight_bytes = what the baseline keeps resident:",
+        "  fused/dequant: packed codes + FP16 scales (group 128, ~4.1 bits/weight)",
+        "  bnb_nf4: packed codes + FP32 absmax (block 64, ~4.5 bits/weight)",
         "Peak MiB is torch.cuda.max_memory_allocated() after the timed loop.",
     ]
     for line in header:
@@ -349,18 +365,19 @@ def main() -> None:
     with torch.inference_mode():
         for baseline in requested:
             print(f"\nRunning {baseline} ...")
-            for shape_name, k, n in SHAPES:
-                row = run_one(
-                    baseline,
-                    shape_name,
-                    args.m,
-                    k,
-                    n,
-                    args.warmup,
-                    args.iters,
-                    device,
-                )
-                rows.append(row)
+            for m in args.m:
+                for shape_name, k, n in SHAPES:
+                    row = run_one(
+                        baseline,
+                        shape_name,
+                        m,
+                        k,
+                        n,
+                        args.warmup,
+                        args.iters,
+                        device,
+                    )
+                    rows.append(row)
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 

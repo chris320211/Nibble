@@ -5,6 +5,9 @@ from w4a16.cuda import linear_cuda
 from w4a16.quantization import quantize_and_pack_weights
 from w4a16.reference import dequantize_weights, linear_reference
 
+# Largest M routed to the fused CUDA kernels; larger M uses dequant + cuBLAS.
+FUSED_MAX_ROWS = 8
+
 
 class QuantizedLinear(torch.nn.Module):
     """Inference-only linear layer backed by packed INT4 weights."""
@@ -156,10 +159,10 @@ class QuantizedLinear(torch.nn.Module):
                 raise ValueError("packed_weights must be contiguous")
             if not self.scales.is_contiguous():
                 raise ValueError("scales must be contiguous")
-            # Decode (M=1) uses the fused kernel. Prefill (M>1) dequantizes a
-            # temporary FP16 weight matrix and uses cuBLAS so generate is not
-            # stuck on the naive fused fallback.
-            if self.fused and rows == 1:
+            # Decode (M=1) and small batches (M<=8) use the fused kernels.
+            # Prefill (M>8) dequantizes a temporary FP16 weight matrix and uses
+            # cuBLAS so generate is not stuck on the naive fused fallback.
+            if self.fused and rows <= FUSED_MAX_ROWS:
                 flat_output = linear_cuda(
                     flat_activations,
                     self.packed_weights,

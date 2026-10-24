@@ -22,7 +22,11 @@ def linear_cuda(
     scales: torch.Tensor,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Run the naive fused W4A16 CUDA linear operator."""
+    """Run the fused W4A16 CUDA linear operator.
+
+    group_size=128 uses the warp-per-channel kernels (M=1 decode, M=2..8 small
+    batch). Other shapes fall back to the naive one-thread-per-output kernel.
+    """
     if _EXTENSION_LOAD_ERROR is not None:
         raise RuntimeError(
             "The W4A16 CUDA extension is not built. Build it with "
