@@ -28,6 +28,7 @@ generate per prompt compiles (slow); the untimed text run and warmup absorb it.
 """
 
 import argparse
+import gc
 import statistics
 import sys
 import time
@@ -477,6 +478,10 @@ def run_mode(
         row["peak_mib"] = peak_mib
 
     del model
+    # Reference cycles (e.g. bitsandbytes quant states) keep a model alive past
+    # `del`; collect them so --mode all does not count the last mode's weights
+    # in the next mode's allocated/peak MiB.
+    gc.collect()
     if args.device == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
