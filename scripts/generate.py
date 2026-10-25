@@ -143,11 +143,19 @@ def load_bnb_nf4_model(model_id: str, device: str) -> torch.nn.Module:
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
     )
-    return AutoModelForCausalLM.from_pretrained(
-        model_id,
-        quantization_config=quantization_config,
-        device_map={"": torch.cuda.current_device()},
-    )
+    # FP16 for everything bitsandbytes leaves unquantized (embeddings, norms,
+    # attention, KV cache, lm_head), like the other modes. Without a dtype,
+    # transformers 5 keeps the checkpoint's bfloat16, which T4 emulates slowly.
+    kwargs = {
+        "quantization_config": quantization_config,
+        "device_map": {"": torch.cuda.current_device()},
+    }
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16, **kwargs)
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.float16, **kwargs
+        )
 
 
 def allow_auto_compile(model: torch.nn.Module) -> None:
