@@ -31,8 +31,8 @@ Google Colab Tesla T4, `group_size = 128`. Do not copy numbers from other GPUs.
 
 **Headline:** TinyLlama-1.1B decode with CUDA graphs runs at **174 tok/s with
 fused INT4 vs 85 tok/s FP16** (2.0x), with **643 MiB vs 2100 MiB** of weights
-resident. Per layer, the `M = 1` kernel is 3.0-3.5x faster than FP16 cuBLAS at
-72-88% of measured DRAM bandwidth.
+resident. Per layer, the `M = 1` kernel is 3.0-3.5x faster than FP16 cuBLAS and
+1.6-2.2x faster than bitsandbytes NF4, at 72-88% of measured DRAM bandwidth.
 
 ### Operator (`M = 1`)
 
@@ -56,6 +56,41 @@ which is normal sustained T4 behavior:
 Packed weights are ~3.9x smaller than FP16, which caps the possible speedup for
 a memory-bound GEMV at about 3.9x. T4 has no INT4 Tensor Cores; the kernel
 unpacks nibbles and does FP32 math.
+
+### Against bitsandbytes NF4
+
+bitsandbytes 0.50.2 `matmul_4bit` (NF4, block 64, the Hugging Face
+`load_in_4bit` default; see [Comparison with bitsandbytes
+NF4](#comparison-with-bitsandbytes-nf4)), timed the same way in the same
+session. Its output is checked against its own dequantize + `F.linear` before
+timing. `%copy` accounts for its larger format (FP32 absmax per 64 weights, ~9%
+more bytes than packed codes + FP16 scales per 128).
+
+`M = 1` (decode):
+
+| shape (K, N) | FP16 cuBLAS us | bnb NF4 us | fused us | fused vs bnb | %copy bnb / fused |
+| --- | --- | --- | --- | --- | --- |
+| attention-like (2048, 2048) | 39.8 | 19.9 | 12.5 | 1.6x faster | 49% / 72% |
+| mlp up-like (2048, 5632) | 106.5 | 61.3 | 28.3 | 2.2x faster | 44% / 87% |
+| mlp down-like (5632, 2048) | 99.9 | 61.1 | 32.1 | 1.9x faster | 44% / 77% |
+
+The lead is not from clocks: the bnb rows ran at a higher SM clock (1170-1320
+MHz) than the fused rows (915-1245 MHz).
+
+`M = 4` (four tokens at once, this repo's small-batch kernel):
+
+| shape (K, N) | FP16 cuBLAS us | bnb NF4 us | fused us |
+| --- | --- | --- | --- |
+| attention-like (2048, 2048) | 58.6 | 51.3 | 45.6 |
+| mlp up-like (2048, 5632) | 100.1 | 134.6 | 134.5 |
+| mlp down-like (5632, 2048) | 115.7 | 140.3 | 131.0 |
+
+At `M = 4` both 4-bit kernels tie each other and lose to FP16 on the MLP
+shapes. They move only 45-50 GB/s, so they are limited by the work per weight
+(unpack, then four rows of FP32 math), not by memory, and the power-capped SM
+clock (750-990 MHz for the fused rows) hurts them more than cuBLAS. The
+small-batch kernel still uses the original design (2-byte loads, shared-memory
+barriers); the v2-v4 decode changes have not been applied to it yet.
 
 Decode kernel versions (`W4A16_DECODE`), alternated twice in one session, mean
 of the two runs in us (SM clock 690-1290 MHz, power-capped):
