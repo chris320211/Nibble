@@ -29,9 +29,9 @@ T4. The quantizer only exists to produce packed weights in a known format.
 
 Google Colab Tesla T4, `group_size = 128`. Do not copy numbers from other GPUs.
 
-**Headline:** TinyLlama-1.1B decode with CUDA graphs runs at **174 tok/s with
-fused INT4 vs 85 tok/s FP16** (2.0x), with **643 MiB vs 2100 MiB** of weights
-resident. Per layer, the `M = 1` kernel is 3.0-3.5x faster than FP16 cuBLAS and
+**Headline:** TinyLlama-1.1B decode with CUDA graphs runs at **~184 tok/s with
+fused INT4 vs ~118 tok/s bitsandbytes NF4 and ~89 tok/s FP16** (1.6x and 2.1x),
+with **643 MiB vs 790 MiB and 2100 MiB** resident. Per layer, the `M = 1` kernel is 3.0-3.5x faster than FP16 cuBLAS and
 1.6-2.2x faster than bitsandbytes NF4, at 72-88% of measured DRAM bandwidth.
 
 ### Operator (`M = 1`)
@@ -123,18 +123,26 @@ change, so this compute-heavy kernel slows down more than cuBLAS. The table's
 32` forced (every mode decodes 32 tokens), 1 warmup + median of 5 runs (see
 [Generate benchmark methodology](#generate-benchmark-methodology)). Fused: v4
 `M = 1` kernel for decode, CUDA dequantize + cuBLAS for prefill (`M > 8`). FP16
-and bnb-nf4 load Hugging Face weights; fused and dequant load packed weights
-only (155 layers). One Colab session; bnb-nf4 is from a `--mode all` run in it.
+and bnb-nf4 load Hugging Face weights in FP16; fused and dequant load packed
+weights only (155 layers).
 
 **With CUDA graphs** (`--cuda-graphs`: static KV cache, decode step compiled with
-`torch.compile(mode="reduce-overhead")`; `decode_compiled: yes` for both):
+`torch.compile(mode="reduce-overhead")`; `decode_compiled: yes` for all three),
+one Colab session:
 
 | mode | prompt | prefill ms | decode ms | decode tok/s | e2e tok/s | allocated MiB | peak MiB |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| FP16 | haiku | 37.4 | 363.5 | 85.29 | 79.83 | 2100.18 | 2113.88 |
-| FP16 | 2+2 | 37.4 | 366.1 | 84.68 | 79.30 | 2100.18 | 2113.88 |
-| fused | haiku | 50.2 | 177.8 | **174.35** | **140.35** | **642.59** | **674.81** |
-| fused | 2+2 | 49.5 | 178.2 | **173.92** | **140.50** | **642.59** | **674.81** |
+| FP16 | haiku | 44.1 | 343.8 | 90.16 | 82.48 | 2100.18 | 2111.07 |
+| FP16 | 2+2 | 35.1 | 350.5 | 88.45 | 83.00 | 2100.18 | 2111.07 |
+| bnb-nf4 | haiku | 44.4 | 259.7 | 119.35 | 105.23 | 789.50 | 801.27 |
+| bnb-nf4 | 2+2 | 47.0 | 262.5 | 118.07 | 103.39 | 789.50 | 801.27 |
+| fused | haiku | 75.9 | 147.9 | 209.53* | **142.97** | **642.59** | **674.81** |
+| fused | 2+2 | 50.2 | 168.8 | **183.62** | **146.11** | **642.59** | **674.81** |
+
+\* The fused haiku prefill median (75.9 ms) was noisy; other runs measure ~50
+ms. `decode_ms` is total minus prefill, so a high prefill inflates decode
+tok/s. Its e2e tok/s matches the 2+2 row, so ~184 tok/s is the fused decode
+rate.
 
 **Eager** (default Hugging Face generate):
 
@@ -142,19 +150,29 @@ only (155 layers). One Colab session; bnb-nf4 is from a `--mode all` run in it.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | FP16 | haiku | 31.7 | 843.2 | 36.77 | 36.58 | 2100.18 | 2111.17 |
 | FP16 | 2+2 | 32.0 | 857.4 | 36.16 | 35.98 | 2100.18 | 2111.17 |
-| bnb-nf4 | haiku | 48.4 | 1387.9 | 22.34 | 22.28 | 798.00 | 800.87 |
-| bnb-nf4 | 2+2 | 48.7 | 1367.3 | 22.67 | 22.60 | 798.00 | 800.87 |
+| bnb-nf4 | haiku | 41.8 | 1197.6 | 25.88 | 25.82 | 789.50 | 801.37 |
+| bnb-nf4 | 2+2 | 42.6 | 1265.9 | 24.49 | 24.46 | 789.50 | 801.37 |
 | dequant | haiku | 44.5 | 1095.6 | 28.29 | 28.07 | 642.59 | 778.21 |
 | dequant | 2+2 | 40.4 | 1107.6 | 27.99 | 27.87 | 642.59 | 778.21 |
 | fused | haiku | 41.7 | 839.9 | 36.91 | 36.30 | 642.59 | 674.13 |
 | fused | 2+2 | 39.6 | 839.7 | 36.92 | 36.39 | 642.59 | 674.13 |
 
-- **With CUDA graphs, fused INT4 decodes 2.0x faster than FP16** (~174 vs ~85
+- **With CUDA graphs, fused INT4 decodes 2.1x faster than FP16** (~184 vs ~89
   tok/s; 1.8x end to end with prefill) using **3.3x less memory** (643 vs 2100
-  MiB). Per token that is 5.7 ms vs 11.7 ms: streaming the linear weights takes
-  ~3 ms packed vs ~8.5 ms FP16, and the rest (~3 ms: attention, norms, RoPE,
-  sampling) is the same for both, which is why the gap is below the 3.9x weight
-  ratio.
+  MiB). Per token that is 5.4 ms vs 11.3 ms: streaming the linear weights takes
+  roughly 2.5-3 ms packed vs ~8.5 ms FP16, and the rest (attention, norms,
+  RoPE, sampling) is the same for both, which is why the gap is below the 3.9x
+  weight ratio.
+- **Against bitsandbytes NF4, fused decodes 1.6x faster** (~184 vs ~118 tok/s;
+  1.4x end to end) with 19% less memory. Per token that is 5.4 ms vs 8.5 ms.
+  Part of the gap is `lm_head`: bnb keeps it in FP16 (125 MiB read every token,
+  roughly 0.4 ms more than packed by bandwidth estimate), while this repo
+  quantizes it; the rest is the per-layer kernel gap (1.6-2.2x, see
+  [Against bitsandbytes NF4](#against-bitsandbytes-nf4)).
+- transformers 5.20 marks bitsandbytes 4-bit models as not compileable and
+  silently decodes them eagerly even with a static cache; `generate.py
+  --cuda-graphs` overrides that flag for bnb-nf4 so all three modes are
+  compiled.
 - **Eager decode is CPU-bound**: ~27 ms per token, mostly Python and Hugging
   Face launching hundreds of small ops while the GPU waits, so fused and FP16
   both land at ~37 tok/s and the faster kernel is invisible. CUDA graphs
@@ -163,8 +181,10 @@ only (155 layers). One Colab session; bnb-nf4 is from a `--mode all` run in it.
   Python dequant: several full-size int8/float32 passes per layer) to ~40 ms,
   against ~32 ms FP16, and fused peak memory from 751 to 674 MiB. dequant mode
   (dequantize every call, including decode) went from 5.6 to 28 tok/s.
-- bnb-nf4 was only run eager; compare it with the eager rows (fused eager is
-  1.6x NF4 at 20% less memory; NF4 keeps `lm_head` in FP16).
+- Eager bnb-nf4 rows are from a later session than the other eager rows. Earlier
+  bnb-nf4 runs left everything outside the 4-bit layers in TinyLlama's
+  checkpoint dtype, bfloat16, which T4 emulates slowly; `generate.py` now loads
+  it in FP16 like the other modes.
 - Fused and dequant greedy text match each other, with and without CUDA graphs;
   FP16 and NF4 wording differs (quantization).
 
