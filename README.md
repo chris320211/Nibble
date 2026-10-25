@@ -157,7 +157,7 @@ python scripts/generate.py --mode bnb-nf4
 python scripts/generate.py --mode all --checkpoint checkpoints/tinyllama-w4a16.pt
 python scripts/generate.py --mode fused --checkpoint checkpoints/tinyllama-w4a16.pt --cuda-graphs
 python scripts/benchmark.py --m 1 2 4 8
-python scripts/profile_kernel.py --baselines fused resident_fp16
+python scripts/profile_kernel.py --baselines fused resident_fp16 bnb_nf4
 ```
 
 `--mode all` runs FP16, bnb-nf4 (if installed), dequant, then fused
@@ -181,9 +181,12 @@ affects), and `e2e tok/s` (includes prefill).
 
 ### Comparison with bitsandbytes NF4
 
-`bnb_nf4` (operator) and `--mode bnb-nf4` (generate) use bitsandbytes NF4, the
-4-bit path behind Hugging Face `load_in_4bit`. Formats differ, so this compares
-kernels, not quantization quality:
+`bnb_nf4` (operator, in `profile_kernel.py` and `benchmark.py`) and `--mode
+bnb-nf4` (generate) use bitsandbytes NF4, the 4-bit path behind Hugging Face
+`load_in_4bit`. `profile_kernel.py` times it exactly like the fused kernel (CUDA
+graph, rotating weight copies) and first checks its output against its own
+dequantize + `F.linear`. Formats differ, so this compares kernels, not
+quantization quality; `%copy` normalizes for the extra absmax bytes:
 
 | | this repo | bitsandbytes NF4 |
 | --- | --- | --- |

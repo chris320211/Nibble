@@ -11,9 +11,16 @@ timed alone; it adds Python dispatch and launch latency on top of kernel_us.
 
 Unique payload GB/s is not DRAM traffic. Fused payload is packed weights +
 scales + activations + output. FP16 payload is N*K*2 + activations + output.
+
+bnb_nf4 is bitsandbytes NF4 through matmul_4bit, the 4-bit path behind Hugging
+Face load_in_4bit (blocksize 64, FP32 absmax, no double quant: the transformers
+defaults). Its payload is packed codes + absmax + activations + output, so
+%copy compares how close each kernel gets to bandwidth even though the formats
+store a different number of bits per weight. Skipped if bitsandbytes is missing.
 """
 
 import argparse
+import importlib
 import math
 import subprocess
 import sys
@@ -67,7 +74,13 @@ SHAPES: list[tuple[str, int, int]] = [
     ("small sanity", 256, 8),
 ]
 
-BASELINE_ORDER = ("resident_fp16", "dequant_every_call", "fused")
+BASELINE_ORDER = ("resident_fp16", "dequant_every_call", "bnb_nf4", "fused")
+# transformers' BitsAndBytesConfig default; FP32 absmax per block.
+BNB_BLOCKSIZE = 64
+BNB_ABSMAX_BYTES = 4
+# Relative L2 error allowed between bnb's fused kernel and its own dequantize +
+# F.linear on the same codes; catches a broken baseline, not quantization error.
+BNB_CHECK_RTOL = 1e-2
 
 # GPU state is sampled with nvidia-smi while extra calls keep the GPU busy, so
 # the clock reflects load, not idle. T4 drops its SM clock under its 70 W cap or
@@ -91,6 +104,7 @@ THROTTLE_REASONS = {
 NVTX_NAMES = {
     "resident_fp16": "w4a16_fp16",
     "dequant_every_call": "w4a16_dequant",
+    "bnb_nf4": "w4a16_bnb_nf4",
     "fused": "w4a16_fused",
 }
 
@@ -171,7 +185,7 @@ def parse_args() -> argparse.Namespace:
         "--baselines",
         nargs="+",
         choices=list(BASELINE_ORDER),
-        default=["fused", "resident_fp16"],
+        default=["fused", "resident_fp16", "bnb_nf4"],
         help="Baselines to run, still executed in canonical order and never overlapped.",
     )
     parser.add_argument(
@@ -204,6 +218,13 @@ def parse_args() -> argparse.Namespace:
         help="Write the same table to this path (default: profile_results/latest.txt).",
     )
     return parser.parse_args()
+
+
+def import_bitsandbytes():
+    try:
+        return importlib.import_module("bitsandbytes")
+    except ImportError:
+        return None
 
 
 def median(samples: list[float]) -> float:
@@ -291,6 +312,8 @@ def payload_bytes(baseline: str, m: int, k: int, n: int, group_size: int) -> int
     output_bytes = m * n * 2
     if baseline == "resident_fp16":
         return n * k * 2 + activation_bytes + output_bytes
+    if baseline == "bnb_nf4":
+        return stored_weight_bytes(baseline, k, n, group_size) + activation_bytes + output_bytes
     packed_bytes = n * (k // 2)
     scale_bytes = n * (k // group_size) * 2
     unique = packed_bytes + scale_bytes + activation_bytes + output_bytes
@@ -303,6 +326,8 @@ def payload_bytes(baseline: str, m: int, k: int, n: int, group_size: int) -> int
 def stored_weight_bytes(baseline: str, k: int, n: int, group_size: int) -> int:
     if baseline == "resident_fp16":
         return n * k * 2
+    if baseline == "bnb_nf4":
+        return n * (k // 2) + n * (k // BNB_BLOCKSIZE) * BNB_ABSMAX_BYTES
     return n * (k // 2) + n * (k // group_size) * 2
 
 
@@ -365,6 +390,40 @@ def make_operation(
     return wrap_nvtx(NVTX_NAMES[baseline], inner)
 
 
+def make_bnb_operation(
+    x: torch.Tensor,
+    k: int,
+    n: int,
+    device: torch.device,
+    check: bool,
+) -> Callable[[], torch.Tensor]:
+    """bitsandbytes NF4 matmul_4bit on its own quantization of a random weight."""
+    bnb = import_bitsandbytes()
+    assert bnb is not None
+    source_weight = torch.randn((n, k), dtype=torch.float16, device=device)
+    qweight, quant_state = bnb.functional.quantize_4bit(
+        source_weight,
+        blocksize=BNB_BLOCKSIZE,
+        compress_statistics=False,
+        quant_type="nf4",
+    )
+    del source_weight
+
+    def bnb_nf4() -> torch.Tensor:
+        # Same call as bnb.nn.Linear4bit.forward.
+        return bnb.matmul_4bit(x, qweight.t(), quant_state=quant_state)
+
+    if check:
+        expected = F.linear(x, bnb.functional.dequantize_4bit(qweight, quant_state))
+        error = (bnb_nf4().float() - expected.float()).norm() / expected.float().norm()
+        if error > BNB_CHECK_RTOL:
+            raise RuntimeError(
+                f"bnb_nf4 output differs from its dequantize + F.linear "
+                f"(relative error {error:.3g}); the baseline is not trustworthy"
+            )
+    return wrap_nvtx(NVTX_NAMES["bnb_nf4"], bnb_nf4)
+
+
 def make_operations(
     baseline: str,
     x: torch.Tensor,
@@ -375,7 +434,10 @@ def make_operations(
 ) -> list[Callable[[], torch.Tensor]]:
     """One operation per weight copy, all sharing the same activations."""
     operations: list[Callable[[], torch.Tensor]] = []
-    for _ in range(copies):
+    for index in range(copies):
+        if baseline == "bnb_nf4":
+            operations.append(make_bnb_operation(x, k, n, device, check=index == 0))
+            continue
         if baseline == "resident_fp16":
             weight_fp16 = torch.randn((n, k), dtype=torch.float16, device=device)
             operations.append(
@@ -677,6 +739,13 @@ def main() -> None:
         lines.append(skip)
         requested = [name for name in requested if name != "fused"]
 
+    bnb = import_bitsandbytes() if "bnb_nf4" in requested else None
+    if "bnb_nf4" in requested and bnb is None:
+        skip = "Skipping bnb_nf4: `pip install bitsandbytes` to compare against it."
+        print(skip)
+        lines.append(skip)
+        requested = [name for name in requested if name != "bnb_nf4"]
+
     if not requested:
         sys.exit("No baselines left to run.")
 
@@ -717,6 +786,15 @@ def main() -> None:
         "payload_bytes is unique traffic, not measured DRAM.",
         "fused payload = packed + scales + activations + output.",
         "fp16 payload = N*K*2 + activations + output.",
+        *(
+            [
+                f"bnb_nf4 (bitsandbytes {bnb.__version__}) payload = packed + FP32 "
+                f"absmax per {BNB_BLOCKSIZE} + activations + output; output checked "
+                "against its own dequantize + F.linear."
+            ]
+            if bnb is not None
+            else []
+        ),
         "GB/s = payload_bytes / kernel time.  %peak vs spec DRAM, %copy vs measured copy.",
         "AI = FLOPs / payload_bytes, FLOPs = 2*M*N*K.",
         (
