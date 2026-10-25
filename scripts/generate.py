@@ -25,6 +25,9 @@ kernel barely changes tok/s. --cuda-graphs passes cache_implementation="static";
 transformers then torch.compiles the decode step with mode="reduce-overhead",
 which replays each token as one CUDA graph. Prefill stays eager. The first
 generate per prompt compiles (slow); the untimed text run and warmup absorb it.
+transformers marks bitsandbytes 4-bit models as not compileable and silently
+decodes them eagerly, so with --cuda-graphs bnb-nf4 overrides that flag;
+bitsandbytes 4-bit ops are torch.compile-traceable since 0.46.
 """
 
 import argparse
@@ -144,6 +147,20 @@ def load_bnb_nf4_model(model_id: str, device: str) -> torch.nn.Module:
         model_id,
         quantization_config=quantization_config,
         device_map={"": torch.cuda.current_device()},
+    )
+
+
+def allow_auto_compile(model: torch.nn.Module) -> None:
+    """Let generate auto-compile a model whose quantizer says it cannot.
+
+    Swaps this one quantizer instance to a subclass whose is_compileable is
+    True; other models and the transformers class are untouched.
+    """
+    quantizer = model.hf_quantizer
+    quantizer.__class__ = type(
+        f"Compileable{type(quantizer).__name__}",
+        (type(quantizer),),
+        {"is_compileable": property(lambda self: True)},
     )
 
 
@@ -407,6 +424,9 @@ def run_mode(
         model = load_bnb_nf4_model(args.model, args.device)
         replacement_count = None
         weight_load = "from_pretrained with BitsAndBytesConfig(load_in_4bit)"
+        if args.cuda_graphs and not model.hf_quantizer.is_compileable:
+            allow_auto_compile(model)
+            weight_load += " (is_compileable forced on for --cuda-graphs)"
     else:
         model = load_fp16_model(args.model, args.device)
         replacement_count = None
@@ -463,7 +483,7 @@ def run_mode(
 
     if args.cuda_graphs:
         # transformers stores the compiled forward here once it auto-compiles;
-        # if it is missing, decode ran eagerly (e.g. bitsandbytes is not
+        # if it is missing, decode ran eagerly (e.g. a quantizer that is not
         # compileable) and the timings are not CUDA-graph numbers.
         compiled = hasattr(model, "_compiled_call")
         print(f"decode_compiled: {'yes' if compiled else 'no (ran eager)'}")
