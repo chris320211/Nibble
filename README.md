@@ -1,274 +1,202 @@
 # Nibble: INT4 LLM Decode Kernel
 
-CUDA operator for LLM decode on NVIDIA T4 (`sm_75`):
+Fused CUDA kernel that runs an LLM linear layer straight from 4-bit weights on an NVIDIA T4 (`sm_75`).
 
 ```text
 FP16 activations [M, K]  x  packed INT4 weights [N, K]  ->  FP16 output [M, N]
 ```
 
-Unpack, dequant, and multiply in one kernel. No full FP16 weight matrix in
-global memory. Inference only. Primary shape: single-token decode (`M = 1`),
-with a small-batch kernel for `M = 2..8`.
+- Unpack, dequantize, and multiply in one kernel; no FP16 weight matrix in memory
+- Built for single-token decode (`M = 1`), plus a small-batch kernel for `M = 2..8`
+- Inference only
 
-Kernel correctness is match vs Python `linear_reference` on the same packed
-codes. Difference vs FP16 `nn.Linear` is quantization error, not kernel error.
+## Highlights
 
-## Scope: a kernel project, not a quantization method
+- **184 tok/s** TinyLlama-1.1B decode vs **118** bitsandbytes NF4 and **88** FP16 (1.6x and 2.1x)
+- **3.3x less memory** than FP16 (643 vs 2100 MiB)
+- **Per layer:** 1.6x to 2.2x faster than bitsandbytes NF4, about 3x faster than FP16 cuBLAS
+- **72% to 88%** of measured DRAM bandwidth
 
-The quantization here is deliberately simple and **lossy**: plain
-round-to-nearest, symmetric, per-group absmax scaling down to 4 bits. It is not
-a novel method and not production quality: no calibration data, no outlier
-handling, no error compensation (GPTQ, AWQ, and similar do all of that). Model
-quality is expected to drop and is not measured here.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/decode_dark.png">
+  <img alt="TinyLlama decode: 184 tok/s this repo, 118 bitsandbytes NF4, 88 FP16" src="docs/decode_light.png">
+</picture>
 
-The point of the project is the **kernel**: given weights already packed to
-INT4, run the linear layer as fast and with as little memory as possible on a
-T4. The quantizer only exists to produce packed weights in a known format.
+## Scope
 
-## Results (Colab T4)
+- A kernel project, not a quantization method
+- The quantizer is deliberately simple and lossy: round to nearest, symmetric, absmax per 128 weights
+- No calibration, outlier handling, or error compensation (GPTQ and AWQ do that)
+- Model quality is not measured; text differs from FP16 because of quantization
+- Kernel correctness is checked against a Python reference on the same packed codes
 
-Google Colab Tesla T4, `group_size = 128`. Do not copy numbers from other GPUs.
+## Results
 
-**Headline:** TinyLlama-1.1B decode with CUDA graphs runs at **~184 tok/s with
-fused INT4 vs ~118 tok/s bitsandbytes NF4 and ~89 tok/s FP16** (1.6x and 2.1x),
-with **643 MiB vs 790 MiB and 2100 MiB** resident. Per layer, the `M = 1` kernel is 3.0-3.5x faster than FP16 cuBLAS and
-1.6-2.2x faster than bitsandbytes NF4, at 72-88% of measured DRAM bandwidth.
+- Google Colab Tesla T4, `group_size = 128`
+- T4 runs power capped (`sw-power`, SM 500 to 1300 of 1590 MHz) under sustained load
+- Clocks drift between sessions, so compare rows within one table
 
-### Operator (`M = 1`)
+### One layer, one token (`M = 1`)
 
-`scripts/profile_kernel.py`: GPU time per call over 100 back-to-back calls
-replayed from a CUDA graph, with weight copies rotated so every call reads DRAM
-(as in real decode, where each layer has its own weights). `%copy` is GB/s
-against a device-to-device copy measured on the same GPU (about 241 GB/s on a
-Colab T4; spec is 320). Weight MiB is resident FP16 storage, or packed codes +
-scales.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/layers_dark.png">
+  <img alt="Per-layer time: this repo 12.5/28.3/32.1 us, bitsandbytes 19.9/61.3/61.1 us, FP16 39.8/106.5/99.9 us" src="docs/layers_light.png">
+</picture>
 
-v4 decode kernel (default, 4 rows per warp) and FP16 cuBLAS, same run. The T4
-ran power-capped (`sw-power`, SM 750-1290 MHz of 1590) for nearly every row,
-which is normal sustained T4 behavior:
-
-| shape (K, N) | FP16 cuBLAS us | fused us | fused vs FP16 | fused %copy | weight MiB FP16 / packed |
+| layer (K x N) | FP16 us | bnb NF4 us | this repo us | vs bnb | %copy bnb / this repo |
 | --- | --- | --- | --- | --- | --- |
-| attention-like (2048, 2048) | 38.6 | 12.5 | 3.1x faster | 72% | 8.00 / 2.06 |
-| mlp up-like (2048, 5632) | 97.4 | 28.2 | 3.5x faster | 88% | 22.00 / 5.67 |
-| mlp down-like (5632, 2048) | 95.7 | 31.6 | 3.0x faster | 78% | 22.00 / 5.67 |
+| attention (2048 x 2048) | 39.8 | 19.9 | **12.5** | 1.6x | 49% / 72% |
+| mlp up (2048 x 5632) | 106.5 | 61.3 | **28.3** | 2.2x | 44% / 87% |
+| mlp down (5632 x 2048) | 99.9 | 61.1 | **32.1** | 1.9x | 44% / 77% |
 
-Packed weights are ~3.9x smaller than FP16, which caps the possible speedup for
-a memory-bound GEMV at about 3.9x. T4 has no INT4 Tensor Cores; the kernel
-unpacks nibbles and does FP32 math.
+- `%copy`: achieved GB/s vs a measured device copy (~241 GB/s; spec 320)
+- Packed weights are 3.9x smaller than FP16, which caps the speedup near 3.9x
+- vs FP16: 3.1x to 3.8x here; FP16 hit a 510 MHz clock on the MLP rows, and an earlier session measured 3.0x to 3.5x
+- The lead over bnb is not from clocks: bnb rows ran at a higher SM clock (1170 to 1320 MHz vs 915 to 1245)
+- bnb stores ~9% more bytes (FP32 absmax per 64 weights); `%copy` accounts for that
+- bnb output is checked against its own dequantize + `F.linear` before timing
 
-### Against bitsandbytes NF4
+### Four tokens at once (`M = 4`)
 
-bitsandbytes 0.50.2 `matmul_4bit` (NF4, block 64, the Hugging Face
-`load_in_4bit` default; see [Comparison with bitsandbytes
-NF4](#comparison-with-bitsandbytes-nf4)), timed the same way in the same
-session. Its output is checked against its own dequantize + `F.linear` before
-timing. `%copy` accounts for its larger format (FP32 absmax per 64 weights, ~9%
-more bytes than packed codes + FP16 scales per 128).
-
-`M = 1` (decode):
-
-| shape (K, N) | FP16 cuBLAS us | bnb NF4 us | fused us | fused vs bnb | %copy bnb / fused |
-| --- | --- | --- | --- | --- | --- |
-| attention-like (2048, 2048) | 39.8 | 19.9 | 12.5 | 1.6x faster | 49% / 72% |
-| mlp up-like (2048, 5632) | 106.5 | 61.3 | 28.3 | 2.2x faster | 44% / 87% |
-| mlp down-like (5632, 2048) | 99.9 | 61.1 | 32.1 | 1.9x faster | 44% / 77% |
-
-The lead is not from clocks: the bnb rows ran at a higher SM clock (1170-1320
-MHz) than the fused rows (915-1245 MHz).
-
-`M = 4` (four tokens at once, this repo's small-batch kernel):
-
-| shape (K, N) | FP16 cuBLAS us | bnb NF4 us | fused us |
+| layer (K x N) | FP16 us | bnb NF4 us | this repo us |
 | --- | --- | --- | --- |
-| attention-like (2048, 2048) | 58.6 | 51.3 | 45.6 |
-| mlp up-like (2048, 5632) | 100.1 | 134.6 | 134.5 |
-| mlp down-like (5632, 2048) | 115.7 | 140.3 | 131.0 |
+| attention (2048 x 2048) | 58.6 | 51.3 | **45.6** |
+| mlp up (2048 x 5632) | **100.1** | 134.6 | 134.5 |
+| mlp down (5632 x 2048) | **115.7** | 140.3 | 131.0 |
 
-At `M = 4` both 4-bit kernels tie each other and lose to FP16 on the MLP
-shapes. They move only 45-50 GB/s, so they are limited by the work per weight
-(unpack, then four rows of FP32 math), not by memory, and the power-capped SM
-clock (750-990 MHz for the fused rows) hurts them more than cuBLAS. The
-small-batch kernel still uses the original design (2-byte loads, shared-memory
-barriers); the v2-v4 decode changes have not been applied to it yet.
+- Both 4-bit kernels tie each other and lose to FP16 on the MLP layers
+- They move only 45 to 50 GB/s: limited by unpack and math per weight, not memory
+- The small-batch kernel still uses the v1 design; it is the next target
 
-Decode kernel versions (`W4A16_DECODE`), alternated twice in one session, mean
-of the two runs in us (SM clock 690-1290 MHz, power-capped):
+### Kernel versions
 
-| version | attention | mlp up | mlp down |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/versions_dark.png">
+  <img alt="mlp up layer time per version: v1 100.8, v2 38.7, v3 37.1, v4 27.9 us" src="docs/versions_light.png">
+</picture>
+
+| version | change | effect |
+| --- | --- | --- |
+| v1 | original: 2-byte loads, two `__syncthreads` per group | about FP16 speed |
+| v2 | 16-byte loads, no barriers, one warp reduction at the end | 2.3x to 3.2x faster than v1 |
+| v3 | FP16 magic-number unpack (one LOP3 per two weights), no `I2F` | removed every `I2F`; time barely moved |
+| v4 | each warp computes 4 output rows and shares activation work | 20% to 35% faster than v3 |
+
+- v3 showed the limit was per-warp overhead, not unpacking; v4 fixes that
+- Each version was measured against the previous one in its own session
+
+Rows per warp, alternated twice in one session (mean us):
+
+| setting | attention | mlp up | mlp down |
 | --- | --- | --- | --- |
-| v3: wide loads + fast unpack, 1 row per warp | 28.0 | 37.1 | 38.7 |
-| v4, 1 row per warp (smaller blocks only) | 25.2 | 38.4 | 38.3 |
+| v3, 1 row per warp | 28.0 | 37.1 | 38.7 |
+| v4, 1 row per warp | 25.2 | 38.4 | 38.3 |
 | v4, 2 rows per warp | 18.3 | 26.9 | 30.7 |
 | v4, 4 rows per warp (default) | 18.1 | 27.9 | 30.9 |
 
-Sharing rows cuts 25-35% against v3; smaller blocks alone do not. 2 and 4 rows
-per warp tie within noise (an earlier session had 4 ahead by ~10% on the MLP
-shapes; this one has them within ~4%).
-
-Earlier steps, each measured against the previous version in its own session:
-v1 (original, 2-byte loads, two `__syncthreads` per group) took 43.8 / 100.8 /
-93.9 us; v2 (16-byte loads, no barriers, one reduction) took 13.5 / 38.7 /
-41.7 us. v3 removed every `I2F` but barely changed time, which showed the
-remaining limit was per-warp overhead and per-row activation conversion, not
-unpacking; v4 shares those across rows.
-
-T4 lowers its SM clock under its 70 W cap or when hot; memory clock does not
-change, so this compute-heavy kernel slows down more than cuBLAS. The table's
-`sm_mhz`, `temp_c`, and `throttle` columns flag rows that ran slowed down.
+- 2 and 4 rows tie within noise; smaller blocks alone do not help
 
 ### TinyLlama generate
 
-`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, chat template, `max_new_tokens =
-32` forced (every mode decodes 32 tokens), 1 warmup + median of 5 runs (see
-[Generate benchmark methodology](#generate-benchmark-methodology)). Fused: v4
-`M = 1` kernel for decode, CUDA dequantize + cuBLAS for prefill (`M > 8`). FP16
-and bnb-nf4 load Hugging Face weights in FP16; fused and dequant load packed
-weights only (155 layers).
+- `TinyLlama/TinyLlama-1.1B-Chat-v1.0`, greedy, chat template, 32 new tokens forced
+- 1 warmup, median of 5 runs
+- This repo: v4 kernel for decode, CUDA dequantize + cuBLAS for prefill
+- FP16 and bnb-nf4 load Hugging Face weights in FP16; this repo loads packed weights only (155 layers)
 
-**With CUDA graphs** (`--cuda-graphs`: static KV cache, decode step compiled with
-`torch.compile(mode="reduce-overhead")`; `decode_compiled: yes` for all three),
-one Colab session:
+With CUDA graphs (`--cuda-graphs`, all three compiled), one session:
 
-| mode | prompt | prefill ms | decode ms | decode tok/s | e2e tok/s | allocated MiB | peak MiB |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| FP16 | haiku | 44.1 | 343.8 | 90.16 | 82.48 | 2100.18 | 2111.07 |
-| FP16 | 2+2 | 35.1 | 350.5 | 88.45 | 83.00 | 2100.18 | 2111.07 |
-| bnb-nf4 | haiku | 44.4 | 259.7 | 119.35 | 105.23 | 789.50 | 801.27 |
-| bnb-nf4 | 2+2 | 47.0 | 262.5 | 118.07 | 103.39 | 789.50 | 801.27 |
-| fused | haiku | 75.9 | 147.9 | 209.53* | **142.97** | **642.59** | **674.81** |
-| fused | 2+2 | 50.2 | 168.8 | **183.62** | **146.11** | **642.59** | **674.81** |
+| mode | prompt | prefill ms | decode tok/s | e2e tok/s | peak MiB |
+| --- | --- | --- | --- | --- | --- |
+| FP16 | haiku | 44.1 | 90.2 | 82.5 | 2111 |
+| FP16 | 2+2 | 35.1 | 88.5 | 83.0 | 2111 |
+| bnb-nf4 | haiku | 44.4 | 119.4 | 105.2 | 801 |
+| bnb-nf4 | 2+2 | 47.0 | 118.1 | 103.4 | 801 |
+| this repo | haiku | 75.9 | 209.5* | **143.0** | **675** |
+| this repo | 2+2 | 50.2 | **183.6** | **146.1** | **675** |
 
-\* The fused haiku prefill median (75.9 ms) was noisy; other runs measure ~50
-ms. `decode_ms` is total minus prefill, so a high prefill inflates decode
-tok/s. Its e2e tok/s matches the 2+2 row, so ~184 tok/s is the fused decode
-rate.
+\* Noisy prefill (usually ~50 ms) inflates decode tok/s, since decode = total minus prefill; use the 2+2 row.
 
-**Eager** (default Hugging Face generate):
+Eager (default Hugging Face generate):
 
-| mode | prompt | prefill ms | decode ms | decode tok/s | e2e tok/s | allocated MiB | peak MiB |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| FP16 | haiku | 31.7 | 843.2 | 36.77 | 36.58 | 2100.18 | 2111.17 |
-| FP16 | 2+2 | 32.0 | 857.4 | 36.16 | 35.98 | 2100.18 | 2111.17 |
-| bnb-nf4 | haiku | 41.8 | 1197.6 | 25.88 | 25.82 | 789.50 | 801.37 |
-| bnb-nf4 | 2+2 | 42.6 | 1265.9 | 24.49 | 24.46 | 789.50 | 801.37 |
-| dequant | haiku | 44.5 | 1095.6 | 28.29 | 28.07 | 642.59 | 778.21 |
-| dequant | 2+2 | 40.4 | 1107.6 | 27.99 | 27.87 | 642.59 | 778.21 |
-| fused | haiku | 41.7 | 839.9 | 36.91 | 36.30 | 642.59 | 674.13 |
-| fused | 2+2 | 39.6 | 839.7 | 36.92 | 36.39 | 642.59 | 674.13 |
+| mode | prompt | prefill ms | decode tok/s | e2e tok/s | peak MiB |
+| --- | --- | --- | --- | --- | --- |
+| FP16 | haiku | 31.7 | 36.8 | 36.6 | 2111 |
+| FP16 | 2+2 | 32.0 | 36.2 | 36.0 | 2111 |
+| bnb-nf4 | haiku | 41.8 | 25.9 | 25.8 | 801 |
+| bnb-nf4 | 2+2 | 42.6 | 24.5 | 24.5 | 801 |
+| dequant | haiku | 44.5 | 28.3 | 28.1 | 778 |
+| dequant | 2+2 | 40.4 | 28.0 | 27.9 | 778 |
+| this repo | haiku | 41.7 | 36.9 | 36.3 | 674 |
+| this repo | 2+2 | 39.6 | 36.9 | 36.4 | 674 |
 
-- **With CUDA graphs, fused INT4 decodes 2.1x faster than FP16** (~184 vs ~89
-  tok/s; 1.8x end to end with prefill) using **3.3x less memory** (643 vs 2100
-  MiB). Per token that is 5.4 ms vs 11.3 ms: streaming the linear weights takes
-  roughly 2.5-3 ms packed vs ~8.5 ms FP16, and the rest (attention, norms,
-  RoPE, sampling) is the same for both, which is why the gap is below the 3.9x
-  weight ratio.
-- **Against bitsandbytes NF4, fused decodes 1.6x faster** (~184 vs ~118 tok/s;
-  1.4x end to end) with 19% less memory. Per token that is 5.4 ms vs 8.5 ms.
-  Part of the gap is `lm_head`: bnb keeps it in FP16 (125 MiB read every token,
-  roughly 0.4 ms more than packed by bandwidth estimate), while this repo
-  quantizes it; the rest is the per-layer kernel gap (1.6-2.2x, see
-  [Against bitsandbytes NF4](#against-bitsandbytes-nf4)).
-- transformers 5.20 marks bitsandbytes 4-bit models as not compileable and
-  silently decodes them eagerly even with a static cache; `generate.py
-  --cuda-graphs` overrides that flag for bnb-nf4 so all three modes are
-  compiled.
-- **Eager decode is CPU-bound**: ~27 ms per token, mostly Python and Hugging
-  Face launching hundreds of small ops while the GPU waits, so fused and FP16
-  both land at ~37 tok/s and the faster kernel is invisible. CUDA graphs
-  replay a whole token at once and remove that overhead.
-- Prefill: the one-pass CUDA dequantize cut fused prefill from ~172 ms (old
-  Python dequant: several full-size int8/float32 passes per layer) to ~40 ms,
-  against ~32 ms FP16, and fused peak memory from 751 to 674 MiB. dequant mode
-  (dequantize every call, including decode) went from 5.6 to 28 tok/s.
-- Eager bnb-nf4 rows are from a later session than the other eager rows. Earlier
-  bnb-nf4 runs left everything outside the 4-bit layers in TinyLlama's
-  checkpoint dtype, bfloat16, which T4 emulates slowly; `generate.py` now loads
-  it in FP16 like the other modes.
-- Fused and dequant greedy text match each other, with and without CUDA graphs;
-  FP16 and NF4 wording differs (quantization).
+- **vs FP16:** 2.1x decode, 1.8x end to end; 5.4 vs 11.3 ms per token
+- **vs bnb:** 1.6x decode, 1.4x end to end, 19% less memory; 5.4 vs 8.5 ms per token
+- Part of the bnb gap is `lm_head`: bnb keeps it in FP16 (125 MiB per token, roughly 0.4 ms); this repo quantizes it
+- The gap stays below 3.9x because attention, norms, and sampling cost the same in every mode
+- Eager decode is CPU bound (~27 ms per token of Python launches), so the kernel speedup is hidden
+- transformers 5.20 marks bnb 4-bit as not compileable; `generate.py` overrides that so all three use CUDA graphs
+- Eager bnb rows are from a later session; earlier runs left non-4-bit layers in bfloat16, which T4 emulates
+- Prefill: the CUDA dequantize kernel cut fused prefill from ~172 ms to ~40 ms
+- This repo and dequant produce identical greedy text
 
-Colab: `notebooks/colab_t4.ipynb`.
+## Quick start
 
-## Install
-
-PyTorch with CUDA and `nvcc`. `setup.py` targets `sm_75`. TinyLlama scripts
-need `transformers`. The bitsandbytes comparison needs `bitsandbytes`
-(optional; skipped if missing).
+- Needs PyTorch with CUDA and `nvcc`; `setup.py` targets `sm_75`
+- TinyLlama scripts need `transformers`; the bnb comparison needs `bitsandbytes` (skipped if missing)
+- CPU tests run without a GPU; CUDA tests skip without CUDA or the extension
+- Colab: [`notebooks/colab_t4.ipynb`](https://colab.research.google.com/github/chris320211/Nibble/blob/main/notebooks/colab_t4.ipynb)
 
 ```bash
 python setup.py build_ext --inplace
 pytest tests/
-```
 
-CPU tests run without a GPU. CUDA tests skip if CUDA or the extension is missing.
-
-```bash
 python scripts/quantize_tinyllama.py
-python scripts/generate.py --mode fp16
-python scripts/generate.py --mode dequant --checkpoint checkpoints/tinyllama-w4a16.pt
-python scripts/generate.py --mode fused --checkpoint checkpoints/tinyllama-w4a16.pt
-python scripts/generate.py --mode bnb-nf4
 python scripts/generate.py --mode all --checkpoint checkpoints/tinyllama-w4a16.pt
 python scripts/generate.py --mode fused --checkpoint checkpoints/tinyllama-w4a16.pt --cuda-graphs
-python scripts/benchmark.py --m 1 2 4 8
 python scripts/profile_kernel.py --baselines fused resident_fp16 bnb_nf4
+python scripts/plot_results.py  # redraw docs/ charts after updating numbers
 ```
 
-`--mode all` runs FP16, bnb-nf4 (if installed), dequant, then fused
-sequentially. Operator `tok/s` in `benchmark.py` is `1000 * M / median_ms` for
-one linear, not full generate.
+- `--mode` is one of `fp16`, `bnb-nf4`, `dequant`, `fused`, or `all` (runs them in sequence)
 
-### Generate benchmark methodology
+## Methodology
 
-Per mode and prompt, `scripts/generate.py`:
+Operator (`scripts/profile_kernel.py`):
 
-1. Runs one untimed generate that stops at EOS and prints its text. This also
-   warms up the CUDA context, cuBLAS, and the caching allocator.
-2. Runs `--warmup` more untimed generates (default 1).
-3. Times `--runs` generates (default 5) of prefill only (`max_new_tokens = 1`)
-   and `--runs` generates forced to exactly `--max-new-tokens` tokens
-   (`min_new_tokens` ignores EOS), so every mode decodes the same length.
+- `kernel_us`: GPU time per call over 100 back-to-back calls replayed from a CUDA graph
+- Weight copies rotate so every call reads DRAM, not the 4 MiB L2, as in real decode
+- `eager_us`: one call timed alone; adds ~30 us of Python launch overhead
+- `%peak` vs spec DRAM, `%copy` vs a measured device-to-device copy
+- `sm_mhz`, `temp_c`, `throttle` from `nvidia-smi` sampled under load flag slowed rows
 
-It reports medians: `prefill_ms`, `decode_ms = total_ms - prefill_ms`,
-`decode tok/s = (new_tokens - 1) / decode_s` (the number the `M = 1` kernel
-affects), and `e2e tok/s` (includes prefill).
+Generate (`scripts/generate.py`), per mode and prompt:
 
-### Comparison with bitsandbytes NF4
+1. One untimed generate that stops at EOS; prints the text and warms up CUDA, cuBLAS, the allocator
+2. `--warmup` more untimed generates (default 1)
+3. `--runs` timed prefill-only generates and `--runs` timed full generates (default 5 each)
 
-`bnb_nf4` (operator, in `profile_kernel.py` and `benchmark.py`) and `--mode
-bnb-nf4` (generate) use bitsandbytes NF4, the 4-bit path behind Hugging Face
-`load_in_4bit`. `profile_kernel.py` times it exactly like the fused kernel (CUDA
-graph, rotating weight copies) and first checks its output against its own
-dequantize + `F.linear`. Formats differ, so this compares kernels, not
-quantization quality; `%copy` normalizes for the extra absmax bytes:
+- Full generates force exactly `--max-new-tokens` tokens, so every mode decodes the same length
+- `decode_ms = total_ms - prefill_ms`; `decode tok/s = (new_tokens - 1) / decode_s`
+
+bitsandbytes comparison:
 
 | | this repo | bitsandbytes NF4 |
 | --- | --- | --- |
-| codes | INT4 `[-7, 7]`, round-to-nearest | NF4 lookup table |
+| codes | INT4 `[-7, 7]`, round to nearest | NF4 lookup table |
 | scales | FP16 per 128 weights (~4.1 bits/weight) | FP32 absmax per 64 (~4.5 bits/weight) |
 | `lm_head` | quantized | FP16 (transformers default) |
 
-## Profile
+## Profiling without Nsight
 
-Neither script needs Nsight, so both run on Colab, where `ncu` fails with
-`ERR_NVGPUCTRPERM`. Rebuild after `setup.py` so NVCC `-lineinfo` is present for
-source-mapped ncu later.
+Colab blocks GPU counters (`ncu` fails with `ERR_NVGPUCTRPERM`), so profiling uses:
 
-- `profile_kernel.py` reports `kernel_us`, GPU time per call over 100
-  back-to-back calls replayed from a CUDA graph. Weight copies are rotated so
-  every call reads DRAM, not L2 (T4 L2 is 4 MiB, larger than packed attention
-  weights). `eager_us` is a single call timed alone, which adds Python dispatch
-  and launch latency (about 30 us on Colab). `%peak` is against spec DRAM
-  (looked up from the GPU name) and `%copy` against a measured device copy.
-- `inspect_kernel.py` reads the built `.so` with `cuobjdump`: registers, spills,
-  occupancy, global load widths, barriers, shuffles, and convert/FMA counts per
-  kernel. SASS is written to `profile_results/sass/`.
+- `profile_kernel.py`: roofline timing as above
+- `inspect_kernel.py`: registers, spills, occupancy, load widths, barriers, shuffles, convert/FMA counts from `cuobjdump`; SASS goes to `profile_results/sass/`
+
+<details>
+<summary>Nsight commands for a GPU with counters enabled</summary>
 
 ```bash
-python scripts/profile_kernel.py --baselines fused resident_fp16
-python scripts/inspect_kernel.py
-# later, when ncu works:
 ncu --target-processes all \
     --profile-from-start off \
     --kernel-name regex:int4_linear_kernel_decode \
@@ -281,11 +209,13 @@ nsys profile -o profile_results/nsys_decode --trace=cuda,nvtx --capture-range=cu
     python scripts/profile_kernel.py --baselines fused --cuda-profiler
 ```
 
+</details>
+
 ## Format
 
-Symmetric group-wise INT4 along `K`. Default `group_size` is 128. Codes in
-`[-7, 7]`; two per `uint8` (even `k` low nibble, odd `k` high nibble, four-bit
-two's complement). Scale: `max(abs(w)) / 7`, or `1.0` for an all-zero group.
+- Symmetric group-wise INT4 along `K`, default `group_size = 128`
+- Codes in `[-7, 7]`, two per `uint8`: even `k` in the low nibble, odd `k` in the high nibble, two's complement
+- Scale: `max(abs(w)) / 7`, or `1.0` for an all-zero group
 
 ```text
 packed_weights: uint8    [N, K / 2]
@@ -294,25 +224,13 @@ scales:         float16  [N, K / group_size]
 
 ## Contract
 
-- CUDA `float16` activations, packed `uint8` weights, `float16` scales; all contiguous
-- Fused path: `M <= 8`, `K % 128 == 0`, `group_size = 128`, activations and
-  packed weights 16-byte aligned (one warp per output channel; `M = 1` wide-load
-  decode kernel, `M = 2..8` small-batch kernel that unpacks each weight once and
-  reuses it for every row)
-- `M = 1` decode: each lane loads 16 packed bytes per step, reads activations
-  from L1 with no `__syncthreads`, and the warp reduces once at the end.
-  Nibbles become FP16 through an exponent bit trick (one LOP3 per two weights)
-  instead of integer-to-float; multiply-adds stay FP32. Each warp computes
-  several output rows (`W4A16_ROWS_PER_WARP` = 1, 2, or 4; default 4) and shares
-  each activation load and conversion across them. `W4A16_DECODE` selects the
-  version for A/B runs: `v1` original shared-memory kernel, `v2` wide loads,
-  `v3` wide loads + fast unpack, `v4` (default) v3 with several rows per warp
-- `QuantizedLinear` with `M > 8` or `fused=False`: CUDA dequantize kernel (one
-  pass to an FP16 `[N, K]` matrix, bit-identical to the Python
-  `dequantize_weights`, needs `group_size % 32 == 0`) + cuBLAS. Calling
-  `linear_cuda` directly with `M > 8`, another group size, or misaligned
-  tensors uses a naive one-thread-per-output kernel
-- No autograd. Bias, if any, is added in Python after the op
+- CUDA `float16` activations, packed `uint8` weights, `float16` scales, all contiguous
+- Fused path: `M <= 8`, `K % 128 == 0`, `group_size = 128`, 16-byte aligned activations and weights
+- `M = 1`: v4 decode kernel; `W4A16_DECODE` (`v1` to `v4`) and `W4A16_ROWS_PER_WARP` (1, 2, 4) select variants for A/B runs
+- `M = 2..8`: small-batch kernel that unpacks each weight once and reuses it for every row
+- `QuantizedLinear` with `M > 8` or `fused=False`: CUDA dequantize kernel (bit-identical to the Python reference) + cuBLAS
+- `linear_cuda` with `M > 8`, another group size, or misaligned tensors: naive one-thread-per-output kernel
+- No autograd; bias is added in Python after the op
 
 ## API
 
