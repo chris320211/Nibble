@@ -1,4 +1,4 @@
-# Fused W4A16 linear (T4)
+# Nibble: INT4 LLM Decode Kernel
 
 CUDA operator for LLM decode on NVIDIA T4 (`sm_75`):
 
